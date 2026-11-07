@@ -422,15 +422,13 @@ function capChange(i){S.cap=$("cp").value;S.rk=$("rk").value;save();$("qt").text
 function chart(i){const z=L[i],c=z.candles,W=640,H=290,n=c.length,w=W/n,bs=Math.max(0,z.idx-z.nb);
 const lo=Math.min(...c.map(x=>x[2]),z.sl,z.dist)*.997,hi=Math.max(...c.map(x=>x[1]))*1.003,y=v=>H-6-(v-lo)/(hi-lo)*(H-26),
 col=z.kind=="demand"?"#16a34a":"#dc2626",ty=Math.min(y(z.prox),y(z.dist)),bh=Math.abs(y(z.prox)-y(z.dist));
-let s=`<svg viewBox="0 0 ${W} ${H}"><rect x="${bs*w}" y="0" width="${Math.max(w,(z.idx-bs)*w)}" height="${H}" fill="${col}" opacity=".08"/>
-<rect class="${z.kind}" x="${bs*w}" y="${ty}" width="${W-bs*w}" height="${Math.max(2,bh)}"/>`;
+let s=`<svg viewBox="0 0 ${W} ${H}"><rect class="${z.kind}" x="${bs*w}" y="${ty}" width="${W-bs*w}" height="${Math.max(2,bh)}"/>`;
 c.forEach((k,j)=>{const cc=k[3]>=k[0]?"#16a34a":"#dc2626",x=j*w+w/2;
 s+=`<line x1="${x}" x2="${x}" y1="${y(k[1])}" y2="${y(k[2])}" stroke="${cc}"/><rect x="${x-w*.35}" y="${y(Math.max(k[0],k[3]))}" width="${w*.7}" height="${Math.max(1,Math.abs(y(k[0])-y(k[3])))}" fill="${cc}"/>`});
-const lb=(j,t)=>j>=0&&j<n?`<text x="${j*w+w/2}" y="10" font-size="9" text-anchor="middle" fill="${col}">${t}</text>`:"";
-s+=lb(bs-1,"Legin")+lb(Math.round((bs+z.idx-1)/2),"Base")+lb(z.idx,"Legout");
+const pu=z.prox>z.dist;
 s+=`<line x1="0" x2="${W}" y1="${y(z.entry)}" y2="${y(z.entry)}" stroke="#2563eb" stroke-dasharray="5"/><text x="4" y="${y(z.entry)-3}" font-size="11" fill="#2563eb">Entry ${z.entry}</text>
 <line x1="0" x2="${W}" y1="${y(z.sl)}" y2="${y(z.sl)}" stroke="#dc2626" stroke-dasharray="5"/><text x="4" y="${y(z.sl)+11}" font-size="11" fill="#dc2626">SL ${z.sl}</text>
-<text x="${W-4}" y="${ty-3}" font-size="9" text-anchor="end" fill="${col}">Proximal ${z.kind=="demand"?z.prox:z.prox}</text><text x="${W-4}" y="${ty+bh+10}" font-size="9" text-anchor="end" fill="${col}">Distal ${z.dist}</text>`;
+<text x="${W-4}" y="${pu?y(z.prox)-3:y(z.prox)+10}" font-size="9" text-anchor="end" fill="${col}">Proximal ${z.prox}</text><text x="${W-4}" y="${pu?y(z.dist)+10:y(z.dist)-3}" font-size="9" text-anchor="end" fill="${col}">Distal ${z.dist}</text>`;
 const p=z.parts;$("mc").innerHTML=`<button class="x" onclick="closeM()">✕</button><div class="sym">${z.sym} · ${z.tt} (${N[z.tf]||z.tf})</div><div class="mut">${z.kind} ${z.pat} · grade ${z.grade} · formed ${z.formed} · price ${z.price}</div>${s}</svg>
 <div class="cap"><label>Capital (₹)<input id="cp" type="number" inputmode="numeric" value="${S.cap}" oninput="capChange(${i})"></label>
 <label>Risk per trade<select id="rk" onchange="capChange(${i})"><option value="1">1% (beginner)</option><option value="1.5">1.5%</option><option value="2">2% (pro)</option></select></label></div>
