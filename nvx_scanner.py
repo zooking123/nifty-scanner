@@ -22,7 +22,8 @@ import argparse, io, json, time, urllib.request, datetime as dt
 import numpy as np, pandas as pd, yfinance as yf
 
 LIST_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-MAX_DIST = 6.0                                  # show zones within 6% of price
+DIST = {"60m": 6, "75m": 6, "125m": 6, "D": 6, "W": 10, "M": 15, "Q": 20, "H": 25, "Y": 30}   # max % distance kept per timeframe
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 GRADES = [(7, "A+"), (6, "A"), (5, "B"), (0, "C")]   # C = below 5 = no trade
 TFS = ["60m", "75m", "125m", "D", "W", "M", "Q", "H", "Y"]     # low -> high
 TT = {"60m": "60m", "75m": "75m", "125m": "125m", "D": "DIT", "W": "WIT", "M": "MIT", "Q": "QIT", "H": "HYIT", "Y": "YIT"}
@@ -56,14 +57,14 @@ def fetch(tickers, period, interval):
         print(f"[{interval}] {i + 1}-{i + len(chunk)} of {len(tickers)}")
         try:
             d = yf.download(chunk, period=period, interval=interval, group_by="ticker",
-                            auto_adjust=True, progress=False, threads=True)
+                            auto_adjust=False, progress=False, threads=True)
         except Exception as e:
             print("  batch failed:", e)
             time.sleep(2)
             continue
         for t in chunk:
             try:
-                x = d[t].dropna()
+                x = d[t][["Open", "High", "Low", "Close"]].dropna()
                 if len(x) > 30:
                     out[t] = x
             except Exception:
@@ -129,14 +130,14 @@ def atr(df, n=14):
     return tr.rolling(n).mean().values
 
 
-def find_zones(df, wmax):
+def find_zones(df, wmax, complete=True):
     """legin (exciting) -> 1..6 base candles -> legout (exciting, explosive). Unbroken zones only."""
     o, h, l, c = (df[k].values for k in ("Open", "High", "Low", "Close"))
     a, n = atr(df), len(df)
     body, rng = np.abs(c - o), h - l
     exc = body > 0.5 * rng                       # exciting candle: body > 50% of the candle
     zones = []
-    for i in range(15, n):
+    for i in range(15, n if complete else n - 1):
         if np.isnan(a[i - 1]) or not exc[i] or body[i] < IMP_ATR * a[i - 1]:
             continue
         j = i - 1
@@ -175,11 +176,13 @@ def find_zones(df, wmax):
             e = h[i + 1:] >= prox
         if broken or abs(prox - dist) / prox > wmax:
             continue
-        touches = (int(e[0]) + int((e[1:] & ~e[:-1]).sum())) if len(e) else 0
+        visits = (int(e[0]) + int((e[1:] & ~e[:-1]).sum())) if len(e) else 0
+        live = bool(len(e) and e[-1])                    # price is inside the zone right now
+        touches = visits - 1 if live else visits         # the visit in progress is the first touch = still fresh
         pre_h, pre_l = h[max(0, j - 120):j], l[max(0, j - 120):j]
         beyond = bool(len(pre_h) and (prox > pre_h.max() if kind == "demand" else prox < pre_l.min()))
         zones.append(dict(i=i, j=j, kind=kind, pat=pat, prox=float(prox), dist=float(dist), nb=nb,
-                          touches=touches, strength=2 if (gap or two) else 1, gap=gap,
+                          touches=touches, live=live, strength=2 if (gap or two) else 1, gap=gap,
                           garb=bool(nb >= 4 and beyond),                       # many base candles at new highs = poor zone
                           wide=bool(abs(prox - dist) > 1.5 * a[i - 1]),         # very wide base = imbalance, avoid
                           hi=beyond))                                          # zone at fresh highs/lows: wait for follow-up
@@ -230,8 +233,17 @@ def grade(s):
     return next(g for m, g in GRADES if s >= m)
 
 
+def last_complete(tf, df):
+    """Daily candle is complete unless the market is open and the last bar is today's."""
+    if tf != "D":
+        return False
+    now = dt.datetime.now(IST)
+    forming = now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) < (15, 30) and df.index[-1].date() == now.date()
+    return not forming
+
+
 def analyse(meta, f):
-    Z = {tf: find_zones(df, WMAX[tf]) for tf, df in f.items()}
+    Z = {tf: find_zones(df, WMAX[tf], last_complete(tf, df)) for tf, df in f.items()}
     res = []
     for k, tf in enumerate(TFS):
         if tf not in f:
@@ -250,7 +262,7 @@ def analyse(meta, f):
                 if z["kind"] != kind:
                     continue
                 d = (last - z["prox"]) / last * 100 if kind == "demand" else (z["prox"] - last) / last * 100
-                if -100 <= d <= MAX_DIST:
+                if -100 <= d <= DIST[tf]:
                     cand.append((abs(d), d, z))
             for _, d, z in sorted(cand, key=lambda x: x[0])[:2]:
                 lo, hi = sorted((z["prox"], z["dist"]))
@@ -282,9 +294,10 @@ def analyse(meta, f):
                     t1, ep = entry + (entry - sl), [entry, (z["prox"] + z["dist"]) / 2, z["dist"] + 0.25 * (z["prox"] - z["dist"])]
                 else:
                     t1, ep = entry - (sl - entry), [entry, (z["prox"] + z["dist"]) / 2, z["dist"] - 0.25 * (z["dist"] - z["prox"])]
-                tail = df.tail(60)
+                win = min(n, 100, max(60, n - 1 - z["j"] + 8))
+                tail = df.tail(win)
                 res.append(dict(
-                    sym=meta[0], name=meta[1], tf=tf, tt=TT[tf], kind=kind, pat=z["pat"], garb=z["garb"], wide=z["wide"], hi=z["hi"], grade=grade(score), score=score,
+                    sym=meta[0], name=meta[1], tf=tf, tt=TT[tf], kind=kind, pat=z["pat"], garb=z["garb"], wide=z["wide"], hi=z["hi"], live=z["live"], grade=grade(score), score=score,
                     parts=[fresh, z["strength"], tbase, 1 if ema_ok else 0],
                     etype="Type 1" if score >= 7 else "Type 2/3" if score >= 5 else "No trade",
                     price=round(last, 2), prox=round(z["prox"], 2), dist=round(z["dist"], 2),
@@ -294,7 +307,7 @@ def analyse(meta, f):
                     higher=higher, conf=conf, htf=htf, itf=itf, loc=loc, trend=trend,
                     rule=rule(kind, loc, trend), cred=bool(z["cred"]), nb=z["nb"], gap=z["gap"],
                     touches=z["touches"], age=n - 1 - z["i"], dist_pct=round(d, 2),
-                    formed=df.index[z["i"]].strftime(fmt), idx=z["i"] - (n - 60),
+                    formed=df.index[z["i"]].strftime(fmt), idx=z["i"] - (n - win),
                     candles=[[round(float(v), 2) for v in r] for r in tail[["Open", "High", "Low", "Close"]].values]))
     return res
 
@@ -315,8 +328,16 @@ def scan(intraday=False):
             ok += 1
         except Exception as e:
             print("skip", t, e)
-    print(f"{len(out)} setups from {ok} stocks")
-    return out
+    asof = ""
+    try:
+        last = max(df.index[-1] for df in daily.values())
+        now = dt.datetime.now(IST)
+        forming = now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) < (15, 30) and last.date() == now.date()
+        asof = f"{last:%d %b %Y}" + (" (today's candle is still forming)" if forming else "")
+    except Exception:
+        pass
+    print(f"{len(out)} setups from {ok} stocks, data till {asof}")
+    return out, asof
 
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Zone Scanner</title><style>
@@ -337,7 +358,7 @@ button,select,input{font:inherit;color:var(--fg);background:var(--card);border:1
 .bd{font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid var(--bd);color:var(--mut)}
 .side{font-weight:700;font-size:12px;margin-left:auto}.demand{color:var(--g)}.supply{color:var(--r)}
 .gr{font-weight:700;font-size:12px;padding:1px 7px;border-radius:6px;background:var(--fg);color:var(--bg)}
-.lv{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:8px;text-align:center}
+.lv{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:8px;text-align:center}
 .lv div{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:4px 2px;font-weight:600;font-size:13px}
 .lv i{display:block;font-style:normal;font-weight:400;font-size:10px;color:var(--mut)}
 .row{display:flex;justify-content:space-between;margin-top:6px}.tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
@@ -349,7 +370,7 @@ details.help{margin:10px 0 24px}details.help summary{cursor:pointer;color:var(--
 .cap{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0}.cap label{display:flex;flex-direction:column;gap:2px;font-size:11px;color:var(--mut)}
 rect.demand{fill:#16a34a33}rect.supply{fill:#dc262633}svg{width:100%;height:auto}.x{float:right;min-height:32px;padding:2px 10px}
 </style></head><body>
-<h1>Zone Scanner · Nifty 500</h1><div class="mut">Last scan: __TIME__ IST · educational only, not investment advice</div>
+<h1>Zone Scanner · Nifty 500</h1><div class="mut">Last scan: __TIME__ IST · Data till: __ASOF__</div><div class="mut">Educational only, not investment advice</div>
 <div class="seg" id="side"></div>
 <div class="tfs" id="tfs"></div>
 <div class="row2"><input id="q" type="search" placeholder="Search stock">
@@ -360,12 +381,12 @@ rect.demand{fill:#16a34a33}rect.supply{fill:#dc262633}svg{width:100%;height:auto
 <b>Year / Half / Qtr / Month / Week / Day</b> = chart on which the zone is made (YIT, HYIT, QIT, MIT, WIT, DIT).<br>
 <b>DBR, RBR</b> = demand (buy) zones, <b>RBD, DBD</b> = supply (sell) zones.<br>
 <b>Grade</b>: A+ = score 7+ (Type 1), A = 6, B = 5, C = below 5 (no trade). <b>Fresh</b> = price never came back to the zone.<br>
-<b>T1</b> = 1:1 target, <b>T2</b> = 2:1 target. Tap a card for the chart, your Qty (set capital and risk there) and full details.<br>
-<b>Rule ✓</b> = higher-timeframe location and trend favour this side. <b>Room ✓</b> = no opposite zone before T2.<br>
+<b>Entry</b> = just beyond the proximal line, <b>Stop loss</b> = just beyond the distal line. Tap a card for the chart, your Qty (set capital and risk there) and full details.<br>
+<b>Rule ✓</b> = higher-timeframe location and trend favour this side. <b>Room ✓</b> = no opposite zone within 2x the stop-loss distance. <b>Price in zone</b> = price is at the zone now (first touch).<br>
 <b>W ✓ / M ✓</b> = a fresh same-side zone on that higher timeframe overlaps this zone or is within 1% (confluence).</div></details>
 <div id="m"><div id="mc"></div></div>
 <script>
-const D=__DATA__,$=id=>document.getElementById(id);
+const D=__DATA__,LIM=__LIM__,$=id=>document.getElementById(id);
 const N={Y:"Yearly",H:"Half-yearly",Q:"Quarterly",M:"Monthly",W:"Weekly",D:"Daily","125m":"125 min","75m":"75 min","60m":"60 min"},
 SH={Y:"Year",H:"Half",Q:"Qtr",M:"Month",W:"Week",D:"Day","125m":"125m","75m":"75m","60m":"60m"},ORD=Object.keys(N),
 LC={low:"Low",eq:"Equilibrium",high:"High",na:"n/a"},TR={up:"Up",down:"Down",side:"Sideways"},PAGE=40;
@@ -377,20 +398,19 @@ if(S.tf!="ALL"&&!D.some(z=>z.tf==S.tf))S.tf="ALL";
 const save=()=>{try{localStorage.setItem("st2",JSON.stringify(S))}catch(e){}};
 const qty=z=>Math.floor((+S.cap||0)*(+S.rk)/100/Math.abs(z.entry-z.sl));
 const chip=(v,a)=>v===true?`<span class="tag on">${a} ✓</span>`:v===false?`<span class="tag off">${a} ✗</span>`:"";
-function match(z,q,skipTf){return(skipTf||S.tf=="ALL"||z.tf==S.tf)&&(!S.side||z.kind==S.side)&&(S.qual=="0"||(z.touches==0&&z.score>=+S.qual))&&(!q||(z.sym+" "+z.name).toLowerCase().includes(q))}
-function card(z,i){const tg=[z.touches?`<span class="tag off">Tested ${z.touches}</span>`:'<span class="tag on">Fresh</span>',chip(z.rule,"Rule"),chip(z.room,"Room")];
+function match(z,q,skipTf,lim){return(skipTf||S.tf=="ALL"||z.tf==S.tf)&&z.dist_pct<=lim&&(!S.side||z.kind==S.side)&&(S.qual=="0"||(z.touches==0&&z.score>=+S.qual))&&(!q||(z.sym+" "+z.name).toLowerCase().includes(q))}
+function card(z,i){const tg=[z.live?'<span class="tag on">Price in zone</span>':'',z.touches?`<span class="tag off">Tested ${z.touches}</span>`:'<span class="tag on">Fresh</span>',chip(z.rule,"Rule"),chip(z.room,"Room")];
 z.conf.forEach(x=>tg.push(`<span class="tag on">${SH[x]} ✓</span>`));
 if(!z.cred)tg.push('<span class="tag off">Reaction zone</span>');if(z.garb)tg.push('<span class="tag off">Poor base</span>');if(z.wide)tg.push('<span class="tag off">Wide base</span>');
 return `<div class="card" onclick="chart(${i})"><div class="hd"><span class="sym">${z.sym}</span><span class="bd">${z.tt}</span><span class="side ${z.kind}">${z.kind=="demand"?"DEMAND":"SUPPLY"} ${z.pat}</span><span class="gr">${z.grade}</span></div>
 <div class="mut nm">₹${z.price} · ${z.dist_pct}% away · ${z.name}</div>
-<div class="lv"><div>${z.entry}<i>Entry</i></div><div class="supply">${z.sl}<i>SL</i></div><div class="demand">${z.t1}<i>T1 1:1</i></div><div class="demand">${z.target}<i>T2 2:1</i></div></div>
-<div class="row"><span>Qty ${qty(z)}</span><span class="mut">Score ${z.score} · ${z.etype}</span></div><div class="tags">${tg.join("")}</div></div>`}
-function draw(){const q=$("q").value.trim().toLowerCase(),cnt={};D.forEach(z=>{if(match(z,q,true))cnt[z.tf]=(cnt[z.tf]||0)+1});
-const tot=Object.values(cnt).reduce((a,b)=>a+b,0);
+<div class="lv"><div>${z.entry}<i>Entry</i></div><div class="supply">${z.sl}<i>Stop loss</i></div><div>${qty(z)}<i>Qty</i></div></div>
+<div class="row"><span class="mut">Score ${z.score} · ${z.etype}</span><span class="mut">${z.plan.split(" (")[0]}</span></div><div class="tags">${tg.join("")}</div></div>`}
+function draw(){const q=$("q").value.trim().toLowerCase(),cnt={};let tot=0;D.forEach(z=>{if(match(z,q,true,LIM[z.tf]))cnt[z.tf]=(cnt[z.tf]||0)+1;if(match(z,q,true,LIM.D))tot++});
 $("side").innerHTML=[["demand","Demand (Buy)","d"],["supply","Supply (Sell)","s"],["","Both",""]].map(([k,n,c])=>`<button class="${c} ${S.side==k?"on":""}" onclick="setSide('${k}')">${n}</button>`).join("");
 $("tfs").innerHTML=[["ALL","All",tot]].concat(ORD.filter(k=>D.some(z=>z.tf==k)).map(k=>[k,SH[k],cnt[k]||0])).map(([k,n,c])=>`<button class="${S.tf==k?"on":""}" onclick="setTf('${k}')"><b>${n}</b><small>${c}</small></button>`).join("");
-L=D.filter(z=>match(z,q,false)).sort(CMP[S.sort]||CMP.price);
-$("cnt").textContent=L.length?`Showing ${Math.min(shown,L.length)} of ${L.length} setups`:"";
+const lim=S.tf=="ALL"?LIM.D:LIM[S.tf];L=D.filter(z=>match(z,q,false,lim)).sort(CMP[S.sort]||CMP.price);
+$("cnt").textContent=L.length?`Showing ${Math.min(shown,L.length)} of ${L.length} setups · zones within ${lim}% of price`:"";
 $("grid").innerHTML=L.length?L.slice(0,shown).map(card).join(""):'<div class="empty">No setups match.<br><br><button onclick="resetAll()">Reset</button></div>';
 $("more").style.display=L.length>shown?"block":"none";$("more").textContent=`Show more (${L.length-shown} left)`}
 function sync(){$("sort").value=S.sort;$("qual").value=S.qual}
@@ -399,18 +419,24 @@ function setSide(k){S.side=k;shown=PAGE;save();draw()}
 function resetAll(){S.side="";S.tf="ALL";S.sort="price";S.qual="5";$("q").value="";shown=PAGE;sync();save();draw()}
 function closeM(){$("m").style.display="none"}
 function capChange(i){S.cap=$("cp").value;S.rk=$("rk").value;save();$("qt").textContent=qty(L[i]);draw()}
-function chart(i){const z=L[i],c=z.candles,W=640,H=280,n=c.length,w=W/n;
-const lo=Math.min(...c.map(x=>x[2]),z.sl)*.995,hi=Math.max(...c.map(x=>x[1]),z.target)*1.005,y=v=>H-(v-lo)/(hi-lo)*H;
-const x0=Math.max(0,z.idx)*w;let s=`<svg viewBox="0 0 ${W} ${H}"><rect class="${z.kind}" x="${x0}" y="${y(Math.max(z.prox,z.dist))}" width="${W-x0}" height="${Math.abs(y(z.prox)-y(z.dist))}"/>`;
-c.forEach((k,j)=>{const col=k[3]>=k[0]?"#16a34a":"#dc2626",x=j*w+w/2;
-s+=`<line x1="${x}" x2="${x}" y1="${y(k[1])}" y2="${y(k[2])}" stroke="${col}"/><rect x="${x-w*.35}" y="${y(Math.max(k[0],k[3]))}" width="${w*.7}" height="${Math.max(1,Math.abs(y(k[0])-y(k[3])))}" fill="${col}"/>`});
-[[z.entry,"#2563eb","Entry"],[z.sl,"#dc2626","SL"],[z.t1,"#16a34a","T1"],[z.target,"#16a34a","T2"]].forEach(([v,col,t])=>s+=`<line x1="0" x2="${W}" y1="${y(v)}" y2="${y(v)}" stroke="${col}" stroke-dasharray="4"/><text x="4" y="${y(v)-3}" font-size="11" fill="${col}">${t} ${v}</text>`);
+function chart(i){const z=L[i],c=z.candles,W=640,H=290,n=c.length,w=W/n,bs=Math.max(0,z.idx-z.nb);
+const lo=Math.min(...c.map(x=>x[2]),z.sl,z.dist)*.997,hi=Math.max(...c.map(x=>x[1]))*1.003,y=v=>H-6-(v-lo)/(hi-lo)*(H-26),
+col=z.kind=="demand"?"#16a34a":"#dc2626",ty=Math.min(y(z.prox),y(z.dist)),bh=Math.abs(y(z.prox)-y(z.dist));
+let s=`<svg viewBox="0 0 ${W} ${H}"><rect x="${bs*w}" y="0" width="${Math.max(w,(z.idx-bs)*w)}" height="${H}" fill="${col}" opacity=".08"/>
+<rect class="${z.kind}" x="${bs*w}" y="${ty}" width="${W-bs*w}" height="${Math.max(2,bh)}"/>`;
+c.forEach((k,j)=>{const cc=k[3]>=k[0]?"#16a34a":"#dc2626",x=j*w+w/2;
+s+=`<line x1="${x}" x2="${x}" y1="${y(k[1])}" y2="${y(k[2])}" stroke="${cc}"/><rect x="${x-w*.35}" y="${y(Math.max(k[0],k[3]))}" width="${w*.7}" height="${Math.max(1,Math.abs(y(k[0])-y(k[3])))}" fill="${cc}"/>`});
+const lb=(j,t)=>j>=0&&j<n?`<text x="${j*w+w/2}" y="10" font-size="9" text-anchor="middle" fill="${col}">${t}</text>`:"";
+s+=lb(bs-1,"Legin")+lb(Math.round((bs+z.idx-1)/2),"Base")+lb(z.idx,"Legout");
+s+=`<line x1="0" x2="${W}" y1="${y(z.entry)}" y2="${y(z.entry)}" stroke="#2563eb" stroke-dasharray="5"/><text x="4" y="${y(z.entry)-3}" font-size="11" fill="#2563eb">Entry ${z.entry}</text>
+<line x1="0" x2="${W}" y1="${y(z.sl)}" y2="${y(z.sl)}" stroke="#dc2626" stroke-dasharray="5"/><text x="4" y="${y(z.sl)+11}" font-size="11" fill="#dc2626">SL ${z.sl}</text>
+<text x="${W-4}" y="${ty-3}" font-size="9" text-anchor="end" fill="${col}">Proximal ${z.kind=="demand"?z.prox:z.prox}</text><text x="${W-4}" y="${ty+bh+10}" font-size="9" text-anchor="end" fill="${col}">Distal ${z.dist}</text>`;
 const p=z.parts;$("mc").innerHTML=`<button class="x" onclick="closeM()">✕</button><div class="sym">${z.sym} · ${z.tt} (${N[z.tf]||z.tf})</div><div class="mut">${z.kind} ${z.pat} · grade ${z.grade} · formed ${z.formed} · price ${z.price}</div>${s}</svg>
 <div class="cap"><label>Capital (₹)<input id="cp" type="number" inputmode="numeric" value="${S.cap}" oninput="capChange(${i})"></label>
 <label>Risk per trade<select id="rk" onchange="capChange(${i})"><option value="1">1% (beginner)</option><option value="1.5">1.5%</option><option value="2">2% (pro)</option></select></label></div>
 <div><b>Qty <span id="qt">${qty(z)}</span></b> <span class="mut">at entry ${z.entry}, SL ${z.sl}</span></div>
 <div class="mut">Score ${z.score} = Fresh ${p[0]} + Strength ${p[1]} + Base ${p[2]} + EMA ${p[3]} → ${z.etype} · base candles ${z.nb}${z.gap?" · gap":""}</div>
-<div class="mut">Plan: ${z.plan}</div><div class="mut">Entry ladder EP1 ${z.ep[0]} / EP2 ${z.ep[1]} / EP3 ${z.ep[2]}</div>
+<div class="mut">Plan: ${z.plan}</div><div class="mut">Entry ladder EP1 ${z.ep[0]} / EP2 ${z.ep[1]} / EP3 ${z.ep[2]} · Proximal ${z.prox} · Distal ${z.dist}</div>
 <div class="mut">Location (${z.htf?N[z.htf]:"n/a"}): ${LC[z.loc]} · Trend (${z.itf?N[z.itf]:"n/a"}): ${z.trend?TR[z.trend]:"–"}</div>
 <div class="mut">Confirmed by: ${z.conf.map(x=>N[x]).join(", ")||"none"} · Opposite zone: ${z.nxt??"none"} · ${z.cred?"Credible":"Reaction of an earlier zone (non-reliable)"}</div>`;
 $("rk").value=S.rk;$("m").style.display="flex"}
@@ -420,9 +446,9 @@ sync();draw();
 </script></body></html>"""
 
 
-def write_html(data, path):
+def write_html(data, path, asof=""):
     ist = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
-    html = PAGE.replace("__DATA__", json.dumps(data)).replace("__TIME__", ist.strftime("%d %b %Y %H:%M"))
+    html = PAGE.replace("__DATA__", json.dumps(data)).replace("__TIME__", ist.strftime("%d %b %Y %H:%M")).replace("__ASOF__", asof or "n/a").replace("__LIM__", json.dumps(DIST))
     open(path, "w", encoding="utf-8").write(html)
     print("Saved", path)
 
@@ -434,7 +460,8 @@ if __name__ == "__main__":
     ap.add_argument("--intraday", action="store_true", help="also scan 60/75/125 min (slower)")
     a = ap.parse_args()
     while True:
-        write_html(scan(a.intraday), a.out)
+        data, asof = scan(a.intraday)
+        write_html(data, a.out, asof)
         if not a.watch:
             break
         time.sleep(a.watch * 60)
