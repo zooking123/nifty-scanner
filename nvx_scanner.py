@@ -24,11 +24,13 @@ import numpy as np, pandas as pd, yfinance as yf
 LIST_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 MAX_DIST = 6.0                                  # show zones within 6% of price
 GRADES = [(7, "A+"), (6, "A"), (5, "B"), (0, "C")]   # C = below 5 = no trade
-TFS = ["60m", "75m", "125m", "D", "W", "M", "Q"]     # low -> high
-WMAX = {"60m": .03, "75m": .03, "125m": .04, "D": .06, "W": .10, "M": .15, "Q": .25}
+TFS = ["60m", "75m", "125m", "D", "W", "M", "Q", "H", "Y"]     # low -> high
+TT = {"60m": "60m", "75m": "75m", "125m": "125m", "D": "DIT", "W": "WIT", "M": "MIT", "Q": "QIT", "H": "HYIT", "Y": "YIT"}
+NEAR_PCT = 1.0   # an HTF zone within 1% of price counts as confluence even if not overlapping
+WMAX = {"60m": .03, "75m": .03, "125m": .04, "D": .06, "W": .10, "M": .15, "Q": .25, "H": .30, "Y": .40}
 # execution TF -> (intermediate/trend TF, higher/location TF); W/M extend the notes' table by one step
 MAP = {"60m": ("D", "W"), "75m": ("D", "W"), "125m": ("D", "W"), "D": ("W", "M"),
-       "W": ("M", "Q"), "M": ("Q", None), "Q": (None, None)}
+       "W": ("M", "Q"), "M": ("Q", "H"), "Q": ("H", "Y"), "H": ("Y", None), "Y": (None, None)}
 OHLC = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
 IMP_ATR = 1.0     # legout must be explosive: body >= 1.0 x ATR (adjustable)
 LEGIN_ATR = 0.5   # legin body >= 0.5 x ATR
@@ -95,14 +97,25 @@ def sess(df, mins):
     return out.dropna()
 
 
+def half(df):
+    keys = [df.index.year, (df.index.month > 6).astype(int)]
+    out = df.groupby(keys).agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"), Close=("Close", "last"))
+    ts = df.index.to_series().groupby(keys).first()
+    out.index = pd.DatetimeIndex(list(ts))
+    return out.dropna()
+
+
 def build(daily, h60, m5):
     f = {}
     if daily is not None:
         f["D"] = daily
-        for k, rules in (("W", ["W"]), ("M", ["ME", "M"]), ("Q", ["QE", "Q"])):
+        for k, rules in (("W", ["W"]), ("M", ["ME", "M"]), ("Q", ["QE", "Q"]), ("Y", ["YE", "A", "Y"])):
             x = rs(daily, rules)
-            if x is not None and len(x) > 25:
+            if x is not None and len(x) > (16 if k in ("Q", "Y") else 25):
                 f[k] = x
+        hx = half(daily)
+        if len(hx) > 16:
+            f["H"] = hx
     if h60 is not None:
         f["60m"] = h60
     if m5 is not None:
@@ -123,7 +136,7 @@ def find_zones(df, wmax):
     body, rng = np.abs(c - o), h - l
     exc = body > 0.5 * rng                       # exciting candle: body > 50% of the candle
     zones = []
-    for i in range(21, n):
+    for i in range(15, n):
         if np.isnan(a[i - 1]) or not exc[i] or body[i] < IMP_ATR * a[i - 1]:
             continue
         j = i - 1
@@ -163,8 +176,13 @@ def find_zones(df, wmax):
         if broken or abs(prox - dist) / prox > wmax:
             continue
         touches = (int(e[0]) + int((e[1:] & ~e[:-1]).sum())) if len(e) else 0
+        pre_h, pre_l = h[max(0, j - 120):j], l[max(0, j - 120):j]
+        beyond = bool(len(pre_h) and (prox > pre_h.max() if kind == "demand" else prox < pre_l.min()))
         zones.append(dict(i=i, j=j, kind=kind, pat=pat, prox=float(prox), dist=float(dist), nb=nb,
-                          touches=touches, strength=2 if (gap or two) else 1, gap=gap))
+                          touches=touches, strength=2 if (gap or two) else 1, gap=gap,
+                          garb=bool(nb >= 4 and beyond),                       # many base candles at new highs = poor zone
+                          wide=bool(abs(prox - dist) > 1.5 * a[i - 1]),         # very wide base = imbalance, avoid
+                          hi=beyond))                                          # zone at fresh highs/lows: wait for follow-up
     for z in zones:      # credibility: a zone overlapping an earlier same-type zone is a "reaction" zone
         lo, hi = sorted((z["prox"], z["dist"]))
         z["cred"] = not any(y["kind"] == z["kind"] and y["i"] < z["j"]
@@ -225,7 +243,7 @@ def analyse(meta, f):
         itf, htf = MAP[tf]
         trend = trend_of(f.get(itf)) if itf else None
         loc = location(f.get(htf), Z.get(htf, []), last) if htf else "na"
-        fmt = "%d %b %y" if tf in ("D", "W", "M", "Q") else "%d %b %H:%M"
+        fmt = "%d %b %y" if tf in ("D", "W", "M", "Q", "H", "Y") else "%d %b %H:%M"
         for kind in ("demand", "supply"):
             cand = []
             for z in Z[tf]:
@@ -236,8 +254,10 @@ def analyse(meta, f):
                     cand.append((abs(d), d, z))
             for _, d, z in sorted(cand, key=lambda x: x[0])[:2]:
                 lo, hi = sorted((z["prox"], z["dist"]))
+                tol = last * NEAR_PCT / 100
                 conf = [x for x in higher if any(
-                    w["kind"] == kind and lo <= max(w["prox"], w["dist"]) and hi >= min(w["prox"], w["dist"])
+                    w["kind"] == kind and w["touches"] == 0
+                    and lo - tol <= max(w["prox"], w["dist"]) and hi + tol >= min(w["prox"], w["dist"])
                     for w in Z[x])]
                 if kind == "demand":
                     entry, sl = z["prox"] * 1.0005, z["dist"] * 0.999
@@ -255,12 +275,20 @@ def analyse(meta, f):
                 tbase = 2 if z["nb"] <= 3 else 1 if z["nb"] <= 5 else 0
                 ema_ok = any(lo <= e <= hi for e in ema)
                 score = fresh + z["strength"] + tbase + (1 if ema_ok else 0)
+                anchored = tf in ("Q", "H", "Y") or any(x in ("Q", "H", "Y") for x in conf)
+                full = z["touches"] == 0 and not z["garb"] and anchored
+                plan = "Full 2:1" if full else "Quick 1:1 (exit at entry if it reverses)"
+                if kind == "demand":
+                    t1, ep = entry + (entry - sl), [entry, (z["prox"] + z["dist"]) / 2, z["dist"] + 0.25 * (z["prox"] - z["dist"])]
+                else:
+                    t1, ep = entry - (sl - entry), [entry, (z["prox"] + z["dist"]) / 2, z["dist"] - 0.25 * (z["dist"] - z["prox"])]
                 tail = df.tail(60)
                 res.append(dict(
-                    sym=meta[0], name=meta[1], tf=tf, kind=kind, pat=z["pat"], grade=grade(score), score=score,
+                    sym=meta[0], name=meta[1], tf=tf, tt=TT[tf], kind=kind, pat=z["pat"], garb=z["garb"], wide=z["wide"], hi=z["hi"], grade=grade(score), score=score,
                     parts=[fresh, z["strength"], tbase, 1 if ema_ok else 0],
                     etype="Type 1" if score >= 7 else "Type 2/3" if score >= 5 else "No trade",
                     price=round(last, 2), prox=round(z["prox"], 2), dist=round(z["dist"], 2),
+                    t1=round(float(t1), 2), ep=[round(float(v), 2) for v in ep], plan=plan,
                     entry=round(entry, 2), sl=round(sl, 2), target=round(float(tgt), 2),
                     nxt=None if nxt is None else round(float(nxt), 2), room=bool(room),
                     higher=higher, conf=conf, htf=htf, itf=itf, loc=loc, trend=trend,
@@ -273,8 +301,9 @@ def analyse(meta, f):
 
 def scan(intraday=False):
     meta = symbols()
+    meta.update({"^NSEI": ("NIFTY50", "Nifty 50"), "^NSEBANK": ("BANKNIFTY", "Nifty Bank")})
     tk = list(meta)
-    daily = fetch(tk, "10y", "1d")
+    daily = fetch(tk, "max", "1d")
     h60 = fetch(tk, "6mo", "60m") if intraday else {}
     m5 = fetch(tk, "60d", "5m") if intraday else {}
     out, ok = [], 0
@@ -290,63 +319,136 @@ def scan(intraday=False):
     return out
 
 
-PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Zone Scanner</title><style>
-:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b7280;--card:#f4f5f7;--bd:#e2e4e8;--g:#16a34a;--r:#dc2626}
-@media(prefers-color-scheme:dark){:root{--bg:#111418;--fg:#e8eaed;--mut:#9aa0a6;--card:#1b2027;--bd:#2c333c}}
-body{margin:0;padding:12px;font:14px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
-h1{font-size:18px;margin:0 0 2px}.mut{color:var(--mut);font-size:12px}
-button,select,input{font:inherit;padding:7px 10px;border:1px solid var(--bd);background:var(--card);color:var(--fg);border-radius:8px}
-input{width:110px}button.on{background:var(--fg);color:var(--bg)}.bar{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
-#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:10px}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px;cursor:pointer}
-.row{display:flex;justify-content:space-between;margin-top:4px}.b{font-weight:600}
-.demand{color:var(--g)}.supply{color:var(--r)}.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Zone Scanner</title><style>
+:root{--bg:#fff;--fg:#14171a;--mut:#667085;--card:#f5f6f8;--bd:#e3e6ea;--g:#16a34a;--r:#dc2626}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1317;--fg:#e8eaed;--mut:#98a2b3;--card:#1a2027;--bd:#2b333d}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.35 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:12px 12px 4px}h1{font-size:17px;margin:0}.mut{color:var(--mut);font-size:12px}
+summary{cursor:pointer;color:var(--mut);font-size:12px;margin-top:4px}
+.sticky{position:sticky;top:0;z-index:5;background:var(--bg);padding:8px 12px;border-bottom:1px solid var(--bd);display:flex;flex-direction:column;gap:6px}
+.top{display:flex;gap:6px}.top input{flex:1;min-width:0}
+.chips{display:flex;gap:6px;flex-wrap:wrap}.scroll{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}.scroll::-webkit-scrollbar{display:none}
+button,select,input{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:7px 11px;min-height:36px}
+.chip{white-space:nowrap}.chip.on,.seg button.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.seg{display:flex;flex:1;border:1px solid var(--bd);border-radius:10px;overflow:hidden}.seg button{border:0;border-radius:0;flex:1}
+.panel{padding:10px 12px;border-bottom:1px solid var(--bd);background:var(--card)}
+.fg{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--mut)}label select,label input{width:100%}
+#cnt{padding:8px 12px 0}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(285px,1fr));gap:10px;padding:10px 12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px 11px;cursor:pointer;min-width:0}
+.hd{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.sym{font-weight:700;font-size:15px}
+.bd{font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid var(--bd);color:var(--mut)}
+.side{font-weight:700;font-size:12px;margin-left:auto}.demand{color:var(--g)}.supply{color:var(--r)}
+.gr{font-weight:700;font-size:12px;padding:1px 7px;border-radius:6px;background:var(--fg);color:var(--bg)}
+.lv{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:8px;text-align:center}
+.lv div{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:4px 2px;font-weight:600}
+.lv i{display:block;font-style:normal;font-weight:400;font-size:10px;color:var(--mut)}
+.row{display:flex;justify-content:space-between;margin-top:6px}.tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
 .tag{font-size:11px;padding:1px 6px;border-radius:6px;border:1px solid var(--bd);color:var(--mut)}.tag.on{color:var(--g);border-color:var(--g)}.tag.off{color:var(--r);border-color:var(--r)}
-#m{position:fixed;inset:0;background:#0008;display:none;align-items:center;justify-content:center;padding:10px;overflow:auto}
-#m>div{background:var(--bg);border-radius:12px;padding:12px;max-width:680px;width:100%}
-rect.demand{fill:#16a34a33}rect.supply{fill:#dc262633}svg{width:100%;height:auto}
+.more{display:block;margin:4px auto 20px}.empty{grid-column:1/-1;text-align:center;padding:30px 10px;color:var(--mut)}
+.help{padding:0 12px 24px}.help div{font-size:12px;color:var(--mut);margin-top:6px;line-height:1.6}
+#m{position:fixed;inset:0;background:#0009;display:none;justify-content:center;padding:10px;overflow:auto;z-index:20}
+#m>div{background:var(--bg);border-radius:14px;padding:12px;max-width:680px;width:100%;margin:auto}
+rect.demand{fill:#16a34a33}rect.supply{fill:#dc262633}svg{width:100%;height:auto}.x{float:right;min-height:30px;padding:2px 10px}
 </style></head><body>
-<h1>Supply &amp; Demand Scanner · Nifty 500</h1><div class="mut">Last scan: __TIME__ IST · educational only, not investment advice</div>
-<div class="mut">Score = Freshness (3/1.5/0) + Strength (2/1) + Time at base (2/1/0) + EMA bonus (1). 7+ = Type 1 entry, 5-6 = Type 2/3, below 5 = no trade.</div>
-<div class="bar" id="tfs"></div>
-<div class="bar"><select id="side"><option value="">Demand + Supply</option><option value="demand">Demand</option><option value="supply">Supply</option></select>
-<select id="sc"><option value="5">Score 5+ (tradable)</option><option value="7">Score 7+ (Type 1)</option><option value="0">All scores</option></select>
-<select id="cf"><option value="0">Any confluence</option><option value="1">1+ higher TF</option><option value="2">2+ higher TF</option></select>
-<select id="rl"><option value="">Any location/trend</option><option value="1">Location+trend OK</option><option value="2">OK + room for 2:1</option></select>
-<select id="px"><option value="6">Within 6%</option><option value="3">Within 3%</option><option value="1">Within 1%</option></select>
-<input id="q" placeholder="Search stock"><input id="cap" type="number" value="100000" title="Capital">
-<select id="rk"><option value="1">Risk 1%</option><option value="1.5">Risk 1.5%</option><option value="2">Risk 2%</option></select>
-<span id="cnt" class="mut" style="align-self:center"></span></div>
-<div id="grid"></div><div id="m" onclick="this.style.display='none'"><div id="mc"></div></div>
+<header><h1>Zone Scanner · Nifty 500</h1><div class="mut">Last scan: __TIME__ IST · educational only, not investment advice</div>
+<details><summary>Market breadth (stocks with a fresh zone within 3% of price)</summary><div id="br" class="mut"></div></details></header>
+<div class="sticky">
+<div class="top"><input id="q" type="search" placeholder="Search stock"><button id="fb">Filters ▾</button></div>
+<div class="chips scroll" id="tfs"></div>
+<div class="chips scroll" id="pre"></div>
+<div class="top"><div class="seg" id="side"></div><select id="sort"><option value="score">Sort: Best score</option><option value="near">Sort: Nearest to price</option><option value="conf">Sort: Most confluence</option><option value="tf">Sort: Highest timeframe</option></select></div>
+</div>
+<div class="panel" id="fp" hidden><div class="fg">
+<label>Freshness<select id="fr"><option value="0">Fresh only</option><option value="1">Fresh + tested once</option><option value="9">Include tested</option></select></label>
+<label>Minimum score<select id="sc"><option value="7">7+ (Type 1)</option><option value="6">6+</option><option value="5">5+ (tradable)</option><option value="0">All</option></select></label>
+<label>Confluence<select id="cf"><option value="0">Any</option><option value="1">1+ higher TF</option><option value="2">2+ higher TF</option></select></label>
+<label>HTF anchor<select id="an"><option value="0">Any</option><option value="1">Quarterly or higher</option><option value="2">Half-yearly / Yearly</option></select></label>
+<label>Location + trend<select id="rl"><option value="">Any</option><option value="1">Rule OK</option><option value="2">Rule OK + room for 2:1</option></select></label>
+<label>Zone quality<select id="qa"><option value="">Any</option><option value="1">Clean zones only</option><option value="2">Watchlist only</option></select></label>
+<label>Distance from price<select id="px"><option value="6">Within 6%</option><option value="3">Within 3%</option><option value="1">Within 1%</option></select></label>
+<label>Risk per trade<select id="rk"><option value="1">1% (beginner)</option><option value="1.5">1.5%</option><option value="2">2% (pro)</option></select></label>
+<label>Capital (₹)<input id="cap" type="number" inputmode="numeric"></label></div>
+<button id="rs">Reset all filters</button></div>
+<div id="cnt" class="mut"></div><div id="grid"></div><button id="more" class="more" style="display:none"></button>
+<details class="help"><summary>How to read this page</summary><div>
+<b>YIT / HYIT / QIT / MIT / WIT / DIT</b> = zone made on the Yearly / Half-yearly / Quarterly / Monthly / Weekly / Daily chart.<br>
+<b>DBR, RBR</b> = demand zones, <b>RBD, DBD</b> = supply zones.<br>
+<b>Grade</b>: A+ = score 7+ (Type 1, set and forget), A = 6, B = 5, C = below 5 (no trade).<br>
+<b>Score</b> = Freshness (3 / 1.5 / 0) + Strength (2 / 1) + Time at base (2 / 1 / 0) + 1 if a 20/50 EMA runs through the zone.<br>
+<b>T1</b> = 1:1 target, <b>T2</b> = 2:1 target. <b>Qty</b> comes from your capital and risk %.<br>
+<b>Rule ✓</b> = higher-timeframe location and trend favour this side. <b>Room ✓</b> = no opposite zone before T2.<br>
+<b>Credible ✗</b> = this zone is only a reaction of an earlier zone. <b>Poor / Wide base</b> = weak zone shape.<br>
+<b>Confluence chips</b>: ✓ = a fresh same-side zone on that higher timeframe overlaps this zone or is within 1%.<br>
+<b>Plan</b>: Full 2:1 = fresh, clean and anchored by Q/H/Y. Quick 1:1 = exit at entry if price reverses.<br>
+<b>☆</b> adds a stock to your watchlist (saved on this phone).</div></details>
+<div id="m"><div id="mc"></div></div>
 <script>
-const D=__DATA__,$=id=>document.getElementById(id),
-N={"60m":"60 min","75m":"75 min","125m":"125 min",D:"Daily",W:"Weekly",M:"Monthly",Q:"Quarterly"},
-LC={low:"Low",eq:"Equilibrium",high:"High",na:"n/a"},TR={up:"Up",down:"Down",side:"Sideways"};let tf="D",L=[];
-Object.keys(N).filter(k=>D.some(z=>z.tf==k)).forEach(k=>{const b=document.createElement("button");b.textContent=N[k];if(k==tf)b.classList.add("on");
-b.onclick=()=>{tf=k;[...$("tfs").children].forEach(x=>x.classList.toggle("on",x==b));draw()};$("tfs").appendChild(b)});
-const t3=(v,a,b)=>v===true?`<span class="tag on">${a} ✓</span>`:v===false?`<span class="tag off">${b||a} ✗</span>`:`<span class="tag">${a} –</span>`;
-const qty=z=>Math.floor((+$("cap").value||0)*(+$("rk").value)/100/Math.abs(z.entry-z.sl));
-const chips=z=>z.higher.length?z.higher.map(x=>`<span class="tag ${z.conf.includes(x)?"on":""}">${x} ${z.conf.includes(x)?"✓":"✗"}</span>`).join(""):'<span class="tag">Highest TF</span>';
-function draw(){const s=$("side").value,g=+$("sc").value,q=$("q").value.toLowerCase(),px=+$("px").value,cf=+$("cf").value,rl=$("rl").value;
-L=D.filter(z=>z.tf==tf&&(!s||z.kind==s)&&z.score>=g&&z.conf.length>=cf&&Math.abs(z.dist_pct)<=px&&(!rl||(z.rule===true&&(rl=="1"||z.room)))&&(z.sym+z.name).toLowerCase().includes(q))
-.sort((a,b)=>b.score-a.score||b.conf.length-a.conf.length||Math.abs(a.dist_pct)-Math.abs(b.dist_pct));
-$("cnt").textContent=L.length+" setups";
-$("grid").innerHTML=L.map((z,i)=>`<div class="card" onclick="chart(${i})"><div class="row"><span class="b">${z.sym}</span><span class="b ${z.kind}">${z.kind.toUpperCase()} ${z.pat} · ${z.grade}</span></div>
-<div class="mut">${z.name} · score ${z.score} · ${z.etype}</div><div class="row"><span>Entry ${z.entry}</span><span>SL ${z.sl}</span></div><div class="row"><span>Target 2:1 ${z.target}</span><span>Qty ${qty(z)}</span></div>
-<div class="chips"><span class="tag">Loc ${LC[z.loc]}</span><span class="tag">Trend ${z.trend?TR[z.trend]:"–"}</span>${t3(z.rule,"Rule")}${t3(z.room,"Room")}${t3(z.cred,"Credible")}</div>
-<div class="chips">${chips(z)}<span class="tag">${z.touches?"Tested "+z.touches:"Fresh"}</span><span class="tag">${z.dist_pct}% away</span></div></div>`).join("")}
+const D=__DATA__,$=id=>document.getElementById(id);
+const N={Y:"Yearly",H:"Half-yearly",Q:"Quarterly",M:"Monthly",W:"Weekly",D:"Daily","125m":"125 min","75m":"75 min","60m":"60 min"},ORD=Object.keys(N),
+LC={low:"Low",eq:"Equilibrium",high:"High",na:"n/a"},TR={up:"Up",down:"Down",side:"Sideways"},RK={Q:1,H:2,Y:3};
+const rankOf=z=>Math.max(RK[z.tf]||0,...z.conf.map(x=>RK[x]||0));
+const PN={best:"⭐ Best setups",tradable:"Tradable (5+)",now:"At the zone now",rules:"Rules OK + room",watch:"My watchlist",all:"Everything"};
+const PRE={best:{fr:"0",sc:"6",rl:"1",qa:"1",px:"3",cf:"0",an:"0"},tradable:{fr:"0",sc:"5",rl:"",qa:"",px:"6",cf:"0",an:"0"},
+now:{fr:"0",sc:"5",rl:"",qa:"",px:"1",cf:"0",an:"0"},rules:{fr:"0",sc:"5",rl:"2",qa:"",px:"6",cf:"0",an:"0"},
+watch:{fr:"9",sc:"0",rl:"",qa:"2",px:"6",cf:"0",an:"0"},all:{fr:"9",sc:"0",rl:"",qa:"",px:"6",cf:"0",an:"0"}};
+const DEF={tf:"ALL",side:"",pre:"tradable",sort:"score",cap:"100000",rk:"1",...PRE.tradable};
+const FK=["fr","sc","cf","an","rl","qa","px","sort","rk"],PAGE=40;
+const CMP={score:(a,b)=>b.score-a.score||b.conf.length-a.conf.length||rankOf(b)-rankOf(a)||Math.abs(a.dist_pct)-Math.abs(b.dist_pct),
+near:(a,b)=>Math.abs(a.dist_pct)-Math.abs(b.dist_pct)||b.score-a.score,conf:(a,b)=>b.conf.length-a.conf.length||b.score-a.score,
+tf:(a,b)=>ORD.indexOf(a.tf)-ORD.indexOf(b.tf)||b.score-a.score};
+let S={...DEF},L=[],shown=PAGE,wl=new Set();
+try{Object.assign(S,JSON.parse(localStorage.getItem("st")||"{}"));wl=new Set(JSON.parse(localStorage.getItem("wl")||"[]"))}catch(e){}
+if(S.tf!="ALL"&&!D.some(z=>z.tf==S.tf))S.tf="ALL";
+const save=()=>{try{localStorage.setItem("st",JSON.stringify(S))}catch(e){}};
+const qty=z=>Math.floor((+S.cap||0)*(+S.rk)/100/Math.abs(z.entry-z.sl));
+const chip=(v,a)=>v===true?`<span class="tag on">${a} ✓</span>`:v===false?`<span class="tag off">${a} ✗</span>`:`<span class="tag">${a} –</span>`;
+const cfc=z=>z.higher.length?z.higher.map(x=>`<span class="tag ${z.conf.includes(x)?"on":""}">${x} ${z.conf.includes(x)?"✓":"✗"}</span>`).join(""):'<span class="tag">Highest TF</span>';
+function match(z,q,skipTf){return(skipTf||S.tf=="ALL"||z.tf==S.tf)&&(!S.side||z.kind==S.side)&&z.score>=+S.sc&&z.touches<=+S.fr&&z.conf.length>=+S.cf&&rankOf(z)>=+S.an&&Math.abs(z.dist_pct)<=+S.px&&
+(!S.rl||(z.rule===true&&(S.rl=="1"||z.room)))&&(!S.qa||(S.qa=="1"?(!z.garb&&!z.wide&&z.cred):wl.has(z.sym)))&&(!q||(z.sym+" "+z.name).toLowerCase().includes(q))}
+const card=(z,i)=>`<div class="card" onclick="chart(${i})"><div class="hd"><span class="sym"><span onclick="star(event,'${z.sym}')">${wl.has(z.sym)?"★":"☆"}</span> ${z.sym}</span><span class="bd">${z.tt}</span>
+<span class="side ${z.kind}">${z.kind.toUpperCase()} ${z.pat}</span><span class="gr">${z.grade}</span></div>
+<div class="mut">${z.name} · price ${z.price} · ${z.dist_pct}% away</div>
+<div class="lv"><div>${z.entry}<i>Entry</i></div><div class="supply">${z.sl}<i>SL</i></div><div class="demand">${z.t1}<i>T1 1:1</i></div><div class="demand">${z.target}<i>T2 2:1</i></div></div>
+<div class="row"><span>Qty ${qty(z)}</span><span class="mut">Score ${z.score} · ${z.etype}</span></div>
+<div class="tags">${chip(z.rule,"Rule")}${chip(z.room,"Room")}${chip(z.cred,"Credible")}<span class="tag ${z.touches?"":"on"}">${z.touches?"Tested "+z.touches:"Fresh"}</span>
+<span class="tag ${z.plan.startsWith("Full")?"on":""}">${z.plan.split(" (")[0]}</span>${z.garb?'<span class="tag off">Poor base</span>':''}${z.wide?'<span class="tag off">Wide base</span>':''}${z.hi?'<span class="tag">At highs/lows</span>':''}</div>
+<div class="tags">${cfc(z)}</div></div>`;
+function sync(){FK.forEach(k=>$(k).value=S[k]);$("cap").value=S.cap}
+function draw(){const q=$("q").value.trim().toLowerCase(),cnt={};D.forEach(z=>{if(match(z,q,true))cnt[z.tf]=(cnt[z.tf]||0)+1});
+const tot=Object.values(cnt).reduce((a,b)=>a+b,0);
+$("tfs").innerHTML=[["ALL","All timeframes",tot]].concat(ORD.filter(k=>D.some(z=>z.tf==k)).map(k=>[k,N[k],cnt[k]||0])).map(([k,n,c])=>`<button class="chip ${S.tf==k?"on":""}" onclick="setTf('${k}')">${n} (${c})</button>`).join("");
+$("pre").innerHTML=Object.keys(PN).map(k=>`<button class="chip ${S.pre==k?"on":""}" onclick="setPre('${k}')">${PN[k]}</button>`).join("");
+$("side").innerHTML=[["","Both"],["demand","Demand"],["supply","Supply"]].map(([k,n])=>`<button class="${S.side==k?"on":""}" onclick="setSide('${k}')">${n}</button>`).join("");
+L=D.filter(z=>match(z,q,false)).sort(CMP[S.sort]||CMP.score);
+$("cnt").textContent=L.length?`Showing ${Math.min(shown,L.length)} of ${L.length} setups`:"";
+$("grid").innerHTML=L.length?L.slice(0,shown).map(card).join(""):'<div class="empty">No setups match these filters.<br><br><button onclick="resetAll()">Reset filters</button></div>';
+$("more").style.display=L.length>shown?"block":"none";$("more").textContent=`Show more (${L.length-shown} left)`}
+function setTf(k){S.tf=k;shown=PAGE;save();draw()}
+function setSide(k){S.side=k;shown=PAGE;save();draw()}
+function setPre(k){Object.assign(S,PRE[k],{pre:k});shown=PAGE;sync();save();draw()}
+function resetAll(){S={...DEF};$("q").value="";shown=PAGE;sync();save();draw()}
+function star(e,s){e.stopPropagation();wl.has(s)?wl.delete(s):wl.add(s);try{localStorage.setItem("wl",JSON.stringify([...wl]))}catch(x){}draw()}
+function closeM(){$("m").style.display="none"}
 function chart(i){const z=L[i],c=z.candles,W=640,H=280,n=c.length,w=W/n;
 const lo=Math.min(...c.map(x=>x[2]),z.sl)*.995,hi=Math.max(...c.map(x=>x[1]),z.target)*1.005,y=v=>H-(v-lo)/(hi-lo)*H;
 const x0=Math.max(0,z.idx)*w;let s=`<svg viewBox="0 0 ${W} ${H}"><rect class="${z.kind}" x="${x0}" y="${y(Math.max(z.prox,z.dist))}" width="${W-x0}" height="${Math.abs(y(z.prox)-y(z.dist))}"/>`;
 c.forEach((k,j)=>{const col=k[3]>=k[0]?"#16a34a":"#dc2626",x=j*w+w/2;
 s+=`<line x1="${x}" x2="${x}" y1="${y(k[1])}" y2="${y(k[2])}" stroke="${col}"/><rect x="${x-w*.35}" y="${y(Math.max(k[0],k[3]))}" width="${w*.7}" height="${Math.max(1,Math.abs(y(k[0])-y(k[3])))}" fill="${col}"/>`});
-[[z.entry,"#2563eb","Entry"],[z.sl,"#dc2626","SL"],[z.target,"#16a34a","Target"]].forEach(([v,col,t])=>s+=`<line x1="0" x2="${W}" y1="${y(v)}" y2="${y(v)}" stroke="${col}" stroke-dasharray="4"/><text x="4" y="${y(v)-3}" font-size="11" fill="${col}">${t} ${v}</text>`);
-const p=z.parts;$("mc").innerHTML=`<div class="b">${z.sym} · ${N[z.tf]} · ${z.kind} ${z.pat} · grade ${z.grade}</div><div class="mut">Formed ${z.formed} · price ${z.price} · base candles ${z.nb}${z.gap?" · gap":""}</div>
+[[z.entry,"#2563eb","Entry"],[z.sl,"#dc2626","SL"],[z.t1,"#16a34a","T1"],[z.target,"#16a34a","T2"]].forEach(([v,col,t])=>s+=`<line x1="0" x2="${W}" y1="${y(v)}" y2="${y(v)}" stroke="${col}" stroke-dasharray="4"/><text x="4" y="${y(v)-3}" font-size="11" fill="${col}">${t} ${v}</text>`);
+const p=z.parts;$("mc").innerHTML=`<button class="x" onclick="closeM()">✕</button><div class="sym">${z.sym} · ${z.tt} (${N[z.tf]||z.tf})</div><div class="mut">${z.kind} ${z.pat} · grade ${z.grade} · formed ${z.formed} · price ${z.price} · base candles ${z.nb}${z.gap?" · gap":""}</div>
 <div class="mut">Score ${z.score} = Fresh ${p[0]} + Strength ${p[1]} + Base ${p[2]} + EMA ${p[3]} → ${z.etype}</div>
+<div class="mut">Plan: ${z.plan}</div><div class="mut">Entry ladder EP1 ${z.ep[0]} / EP2 ${z.ep[1]} / EP3 ${z.ep[2]} · SL ${z.sl}</div>
 <div class="mut">Location (${z.htf?N[z.htf]:"n/a"}): ${LC[z.loc]} · Trend (${z.itf?N[z.itf]:"n/a"}): ${z.trend?TR[z.trend]:"–"}</div>
 <div class="mut">Confirmed by: ${z.conf.map(x=>N[x]).join(", ")||"none"} · Opposite zone: ${z.nxt??"none"} · ${z.cred?"Credible":"Reaction of an earlier zone (non-reliable)"}</div>${s}</svg>`;$("m").style.display="flex"}
-["side","sc","cf","rl","px","q","cap","rk"].forEach(id=>$(id).oninput=draw);draw();
+FK.forEach(k=>$(k).onchange=()=>{S[k]=$(k).value;if(k!="sort"&&k!="rk")S.pre="";shown=PAGE;save();draw()});
+$("cap").oninput=()=>{S.cap=$("cap").value;save();draw()};$("q").oninput=()=>{shown=PAGE;draw()};
+$("fb").onclick=()=>{const h=!$("fp").hidden;$("fp").hidden=h;$("fb").textContent=h?"Filters ▾":"Filters ▴"};
+$("rs").onclick=resetAll;$("more").onclick=()=>{shown+=PAGE;draw()};$("m").onclick=e=>{if(e.target==$("m"))closeM()};
+$("br").textContent=Object.keys(N).filter(k=>D.some(z=>z.tf==k)).map(k=>{const a=D.filter(z=>z.tf==k&&z.touches==0&&z.dist_pct<=3&&z.sym!="NIFTY50"&&z.sym!="BANKNIFTY"),
+c=t=>new Set(a.filter(z=>z.kind==t).map(z=>z.sym)).size;return `${N[k]} ${c("demand")}↑/${c("supply")}↓`}).join(" · ");
+sync();draw();
 </script></body></html>"""
 
 
