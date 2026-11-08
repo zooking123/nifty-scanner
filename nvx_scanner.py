@@ -308,15 +308,44 @@ def analyse(meta, f):
                     rule=rule(kind, loc, trend), cred=bool(z["cred"]), nb=z["nb"], gap=z["gap"],
                     touches=z["touches"], age=n - 1 - z["i"], dist_pct=round(d, 2),
                     formed=df.index[z["i"]].strftime(fmt), idx=z["i"] - (n - win),
+                    span=[df.index[-win].strftime(fmt), df.index[-1].strftime(fmt)],
+                    lc=[df.index[-1].strftime(fmt)] + [round(float(v), 2) for v in df.iloc[-1][["Open", "High", "Low", "Close"]]],
                     candles=[[round(float(v), 2) for v in r] for r in tail[["Open", "High", "Low", "Close"]].values]))
     return res
+
+
+def drop_bad(frames):
+    """Drop tickers whose data looks wrong: identical recent closes under two tickers (mixed data) or no recent candles."""
+    seen, bad = {}, set()
+    for t, df in frames.items():
+        key = tuple(np.round(df.Close.values[-25:], 2))
+        if len(key) < 25:
+            continue
+        if key in seen:
+            bad.update({t, seen[key]})
+        else:
+            seen[key] = t
+    if bad:
+        print("Dropped (same prices under different tickers):", sorted(bad))
+    try:
+        newest = max(df.index[-1] for df in frames.values())
+        stale = {t for t, df in frames.items() if (newest - df.index[-1]).days > 7}
+        if stale:
+            print("Dropped (no recent candles):", sorted(stale))
+        bad |= stale
+    except Exception:
+        pass
+    return {t: df for t, df in frames.items() if t not in bad}
 
 
 def scan(intraday=False):
     meta = symbols()
     meta.update({"^NSEI": ("NIFTY50", "Nifty 50"), "^NSEBANK": ("BANKNIFTY", "Nifty Bank")})
     tk = list(meta)
-    daily = fetch(tk, "max", "1d")
+    daily = drop_bad(fetch(tk, "max", "1d"))
+    for smp in ("ONGC", "RELIANCE", "TCS", "HDFCBANK"):
+        if smp + ".NS" in daily:
+            print("SAMPLE", smp, daily[smp + ".NS"].index[-1].date(), "close", round(float(daily[smp + ".NS"].Close.iloc[-1]), 2))
     h60 = fetch(tk, "6mo", "60m") if intraday else {}
     m5 = fetch(tk, "60d", "5m") if intraday else {}
     out, ok = [], 0
@@ -350,7 +379,7 @@ button,select,input{font:inherit;color:var(--fg);background:var(--card);border:1
 .seg button.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}.seg .d{color:var(--g)}.seg .s{color:var(--r)}.seg .on.d,.seg .on.s{color:var(--bg)}
 .tfs{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:6px}.tfs button{display:flex;flex-direction:column;align-items:center;line-height:1.15;padding:4px 2px}
 .tfs small{font-size:11px;color:var(--mut)}.tfs button.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}.tfs button.on small{color:var(--bg)}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px}.row2 input{grid-column:1/-1}
+.row2{display:grid;grid-template-columns:1.1fr 1fr;gap:6px;margin-bottom:6px}.row3{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px}.row3 label{display:flex;flex-direction:column;gap:2px;font-size:11px;color:var(--mut)}.row3 select{width:100%}
 #cnt{margin:4px 0 8px}
 #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(285px,1fr));gap:10px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px 11px;cursor:pointer;min-width:0}
@@ -374,13 +403,13 @@ rect.demand{fill:#16a34a33}rect.supply{fill:#dc262633}svg{width:100%;height:auto
 <div class="seg" id="side"></div>
 <div class="tfs" id="tfs"></div>
 <div class="row2"><input id="q" type="search" placeholder="Search stock">
-<select id="sort"><option value="price">Price: low to high</option><option value="pricedesc">Price: high to low</option><option value="score">Best score first</option><option value="near">Nearest to zone</option></select>
-<select id="qual"><option value="5">Fresh zones · score 5+</option><option value="7">Fresh zones · score 7+ (best)</option><option value="0">All zones (incl. tested)</option></select></div>
+<select id="sort"><option value="price">Price low→high</option><option value="pricedesc">Price high→low</option><option value="score">Best score</option><option value="near">Nearest zone</option></select></div>
+<div class="row3"><label>Freshness<select id="fr"></select></label><label>Score / entry type<select id="sc"></select></label></div>
 <div id="cnt" class="mut"></div><div id="grid"></div><button id="more" class="more" style="display:none"></button>
 <details class="help"><summary>How to read this page</summary><div>
 <b>Year / Half / Qtr / Month / Week / Day</b> = chart on which the zone is made (YIT, HYIT, QIT, MIT, WIT, DIT).<br>
 <b>DBR, RBR</b> = demand (buy) zones, <b>RBD, DBD</b> = supply (sell) zones.<br>
-<b>Grade</b>: A+ = score 7+ (Type 1), A = 6, B = 5, C = below 5 (no trade). <b>Fresh</b> = price never came back to the zone.<br>
+<b>Freshness</b>: Fresh = price never came back to the zone, Tested 1× / 2×+ = price has returned that many times.<br><b>Score</b>: 7+ = Type 1 (set and forget), 5–6 = Type 2/3 (needs confirmation), below 5 = no trade. Grade A+ = 7+, A = 6, B = 5, C = below 5. The number after each option is how many setups it shows right now.<br>
 <b>Entry</b> = just beyond the proximal line, <b>Stop loss</b> = just beyond the distal line. Tap a card for the chart, your Qty (set capital and risk there) and full details.<br>
 <b>Rule ✓</b> = higher-timeframe location and trend favour this side. <b>Room ✓</b> = no opposite zone within 2x the stop-loss distance. <b>Price in zone</b> = price is at the zone now (first touch).<br>
 <b>W ✓ / M ✓</b> = a fresh same-side zone on that higher timeframe overlaps this zone or is within 1% (confluence).</div></details>
@@ -392,13 +421,17 @@ SH={Y:"Year",H:"Half",Q:"Qtr",M:"Month",W:"Week",D:"Day","125m":"125m","75m":"75
 LC={low:"Low",eq:"Equilibrium",high:"High",na:"n/a"},TR={up:"Up",down:"Down",side:"Sideways"},PAGE=40;
 const CMP={price:(a,b)=>a.price-b.price||b.score-a.score,pricedesc:(a,b)=>b.price-a.price||b.score-a.score,
 score:(a,b)=>b.score-a.score||b.conf.length-a.conf.length||a.price-b.price,near:(a,b)=>Math.abs(a.dist_pct)-Math.abs(b.dist_pct)||a.price-b.price};
-let S={side:"",tf:"ALL",sort:"price",qual:"5",cap:"100000",rk:"1"},L=[],shown=PAGE;
-try{Object.assign(S,JSON.parse(localStorage.getItem("st2")||"{}"))}catch(e){}
-if(S.tf!="ALL"&&!D.some(z=>z.tf==S.tf))S.tf="ALL";
-const save=()=>{try{localStorage.setItem("st2",JSON.stringify(S))}catch(e){}};
+const FR={"0":z=>z.touches==0,"1":z=>z.touches==1,"2":z=>z.touches>=2,all:()=>true},
+SC={"5":z=>z.score>=5,"7":z=>z.score>=7,t23:z=>z.score>=5&&z.score<7,no:z=>z.score<5,all:()=>true},
+FRL=[["0","Fresh"],["1","Tested 1×"],["2","Tested 2×+"],["all","All zones"]],
+SCL=[["5","Score 5+ (tradable)"],["7","7+ · Type 1"],["t23","5–6 · Type 2/3"],["no","Below 5 · no trade"],["all","All scores"]];
+let S={side:"",tf:"ALL",sort:"price",fr:"0",sc:"5",cap:"100000",rk:"1"},L=[],shown=PAGE;
+try{Object.assign(S,JSON.parse(localStorage.getItem("st3")||"{}"))}catch(e){}
+if(S.tf!="ALL"&&!D.some(z=>z.tf==S.tf))S.tf="ALL";if(!FR[S.fr])S.fr="0";if(!SC[S.sc])S.sc="5";
+const save=()=>{try{localStorage.setItem("st3",JSON.stringify(S))}catch(e){}};
 const qty=z=>Math.floor((+S.cap||0)*(+S.rk)/100/Math.abs(z.entry-z.sl));
 const chip=(v,a)=>v===true?`<span class="tag on">${a} ✓</span>`:v===false?`<span class="tag off">${a} ✗</span>`:"";
-function match(z,q,skipTf,lim){return(skipTf||S.tf=="ALL"||z.tf==S.tf)&&z.dist_pct<=lim&&(!S.side||z.kind==S.side)&&(S.qual=="0"||(z.touches==0&&z.score>=+S.qual))&&(!q||(z.sym+" "+z.name).toLowerCase().includes(q))}
+function match(z,q,skipTf,lim,st){st=st||S;return(skipTf||st.tf=="ALL"||z.tf==st.tf)&&z.dist_pct<=lim&&(!st.side||z.kind==st.side)&&FR[st.fr](z)&&SC[st.sc](z)&&(!q||(z.sym+" "+z.name).toLowerCase().includes(q))}
 function card(z,i){const tg=[z.live?'<span class="tag on">Price in zone</span>':'',z.touches?`<span class="tag off">Tested ${z.touches}</span>`:'<span class="tag on">Fresh</span>',chip(z.rule,"Rule"),chip(z.room,"Room")];
 z.conf.forEach(x=>tg.push(`<span class="tag on">${SH[x]} ✓</span>`));
 if(!z.cred)tg.push('<span class="tag off">Reaction zone</span>');if(z.garb)tg.push('<span class="tag off">Poor base</span>');if(z.wide)tg.push('<span class="tag off">Wide base</span>');
@@ -410,13 +443,15 @@ function draw(){const q=$("q").value.trim().toLowerCase(),cnt={};let tot=0;D.for
 $("side").innerHTML=[["demand","Demand (Buy)","d"],["supply","Supply (Sell)","s"],["","Both",""]].map(([k,n,c])=>`<button class="${c} ${S.side==k?"on":""}" onclick="setSide('${k}')">${n}</button>`).join("");
 $("tfs").innerHTML=[["ALL","All",tot]].concat(ORD.filter(k=>D.some(z=>z.tf==k)).map(k=>[k,SH[k],cnt[k]||0])).map(([k,n,c])=>`<button class="${S.tf==k?"on":""}" onclick="setTf('${k}')"><b>${n}</b><small>${c}</small></button>`).join("");
 const lim=S.tf=="ALL"?LIM.D:LIM[S.tf];L=D.filter(z=>match(z,q,false,lim)).sort(CMP[S.sort]||CMP.price);
+const opt=(arr,key)=>arr.map(([v,n])=>`<option value="${v}">${n} · ${D.filter(z=>match(z,q,false,lim,{...S,[key]:v})).length}</option>`).join("");
+$("fr").innerHTML=opt(FRL,"fr");$("sc").innerHTML=opt(SCL,"sc");$("fr").value=S.fr;$("sc").value=S.sc;
 $("cnt").textContent=L.length?`Showing ${Math.min(shown,L.length)} of ${L.length} setups · zones within ${lim}% of price`:"";
 $("grid").innerHTML=L.length?L.slice(0,shown).map(card).join(""):'<div class="empty">No setups match.<br><br><button onclick="resetAll()">Reset</button></div>';
 $("more").style.display=L.length>shown?"block":"none";$("more").textContent=`Show more (${L.length-shown} left)`}
-function sync(){$("sort").value=S.sort;$("qual").value=S.qual}
+function sync(){$("sort").value=S.sort;$("fr").value=S.fr;$("sc").value=S.sc}
 function setTf(k){S.tf=k;shown=PAGE;save();draw()}
 function setSide(k){S.side=k;shown=PAGE;save();draw()}
-function resetAll(){S.side="";S.tf="ALL";S.sort="price";S.qual="5";$("q").value="";shown=PAGE;sync();save();draw()}
+function resetAll(){S.side="";S.tf="ALL";S.sort="price";S.fr="0";S.sc="5";$("q").value="";shown=PAGE;sync();save();draw()}
 function closeM(){$("m").style.display="none"}
 function capChange(i){S.cap=$("cp").value;S.rk=$("rk").value;save();$("qt").textContent=qty(L[i]);draw()}
 function chart(i){const z=L[i],c=z.candles,W=640,H=290,n=c.length,w=W/n,bs=Math.max(0,z.idx-z.nb);
@@ -429,7 +464,7 @@ const pu=z.prox>z.dist;
 s+=`<line x1="0" x2="${W}" y1="${y(z.entry)}" y2="${y(z.entry)}" stroke="#2563eb" stroke-dasharray="5"/><text x="4" y="${y(z.entry)-3}" font-size="11" fill="#2563eb">Entry ${z.entry}</text>
 <line x1="0" x2="${W}" y1="${y(z.sl)}" y2="${y(z.sl)}" stroke="#dc2626" stroke-dasharray="5"/><text x="4" y="${y(z.sl)+11}" font-size="11" fill="#dc2626">SL ${z.sl}</text>
 <text x="${W-4}" y="${pu?y(z.prox)-3:y(z.prox)+10}" font-size="9" text-anchor="end" fill="${col}">Proximal ${z.prox}</text><text x="${W-4}" y="${pu?y(z.dist)+10:y(z.dist)-3}" font-size="9" text-anchor="end" fill="${col}">Distal ${z.dist}</text>`;
-const p=z.parts;$("mc").innerHTML=`<button class="x" onclick="closeM()">✕</button><div class="sym">${z.sym} · ${z.tt} (${N[z.tf]||z.tf})</div><div class="mut">${z.kind} ${z.pat} · grade ${z.grade} · formed ${z.formed} · price ${z.price}</div>${s}</svg>
+const p=z.parts;$("mc").innerHTML=`<button class="x" onclick="closeM()">✕</button><div class="sym">${z.sym} · ${z.tt} (${N[z.tf]||z.tf})</div><div class="mut">${z.kind} ${z.pat} · grade ${z.grade} · formed ${z.formed} · price ${z.price}</div><div class="mut">${N[z.tf]} candles ${z.span[0]} → ${z.span[1]} · last candle ${z.lc[0]}: O ${z.lc[1]} H ${z.lc[2]} L ${z.lc[3]} C ${z.lc[4]} (match with the ${N[z.tf]} chart in your app)</div>${s}</svg>
 <div class="cap"><label>Capital (₹)<input id="cp" type="number" inputmode="numeric" value="${S.cap}" oninput="capChange(${i})"></label>
 <label>Risk per trade<select id="rk" onchange="capChange(${i})"><option value="1">1% (beginner)</option><option value="1.5">1.5%</option><option value="2">2% (pro)</option></select></label></div>
 <div><b>Qty <span id="qt">${qty(z)}</span></b> <span class="mut">at entry ${z.entry}, SL ${z.sl}</span></div>
@@ -438,7 +473,7 @@ const p=z.parts;$("mc").innerHTML=`<button class="x" onclick="closeM()">✕</but
 <div class="mut">Location (${z.htf?N[z.htf]:"n/a"}): ${LC[z.loc]} · Trend (${z.itf?N[z.itf]:"n/a"}): ${z.trend?TR[z.trend]:"–"}</div>
 <div class="mut">Confirmed by: ${z.conf.map(x=>N[x]).join(", ")||"none"} · Opposite zone: ${z.nxt??"none"} · ${z.cred?"Credible":"Reaction of an earlier zone (non-reliable)"}</div>`;
 $("rk").value=S.rk;$("m").style.display="flex"}
-$("sort").onchange=()=>{S.sort=$("sort").value;shown=PAGE;save();draw()};$("qual").onchange=()=>{S.qual=$("qual").value;shown=PAGE;save();draw()};
+$("sort").onchange=()=>{S.sort=$("sort").value;shown=PAGE;save();draw()};$("fr").onchange=()=>{S.fr=$("fr").value;shown=PAGE;save();draw()};$("sc").onchange=()=>{S.sc=$("sc").value;shown=PAGE;save();draw()};
 $("q").oninput=()=>{shown=PAGE;draw()};$("more").onclick=()=>{shown+=PAGE;draw()};$("m").onclick=e=>{if(e.target==$("m"))closeM()};
 sync();draw();
 </script></body></html>"""
