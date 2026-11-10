@@ -195,29 +195,30 @@ def find_zones(df, wmax, complete=True):
 
 
 def trend_of(df):
-    """50 SMA over 7 candles: rising = up (12-3), falling = down (3-6), flat = sideways (close to 3)."""
+    """50 SMA over 7 candles: rising = up (12-3), falling = down (3-6), flat = sideways (close to 3). Returns (label, slope in ATR)."""
     if df is None or len(df) < 60:
-        return None
+        return None, None
     sma = df.Close.rolling(50).mean()
     d, a = float(sma.iloc[-1] - sma.iloc[-8]), atr(df)[-1]
-    if np.isnan(d) or np.isnan(a):
-        return None
-    return "side" if abs(d) < FLAT_ATR * a else ("up" if d > 0 else "down")
+    if np.isnan(d) or np.isnan(a) or a == 0:
+        return None, None
+    return ("side" if abs(d) < FLAT_ATR * a else ("up" if d > 0 else "down")), round(d / a, 2)
 
 
 def location(df, zones, last):
-    """Curve analysis: price position between nearest fresh demand and fresh supply (thirds)."""
+    """Curve analysis: price position between nearest fresh demand and fresh supply (thirds). Returns (loc, demand zone, supply zone)."""
     if df is None:
-        return "na"
-    dem = [z["prox"] for z in zones if z["kind"] == "demand" and z["touches"] == 0 and z["prox"] <= last]
-    sup = [z["prox"] for z in zones if z["kind"] == "supply" and z["touches"] == 0 and z["prox"] >= last]
-    if not dem or not sup:
-        return "eq"                          # notes: missing fresh side = assume equilibrium
-    d, s = max(dem), min(sup)
-    if s <= d:
-        return "eq"
-    p = (last - d) / (s - d)
-    return "low" if p < 1 / 3 else "high" if p > 2 / 3 else "eq"
+        return "na", None, None
+    dem = [z for z in zones if z["kind"] == "demand" and z["touches"] == 0 and z["prox"] <= last]
+    sup = [z for z in zones if z["kind"] == "supply" and z["touches"] == 0 and z["prox"] >= last]
+    dz = max(dem, key=lambda z: z["prox"]) if dem else None
+    sz = min(sup, key=lambda z: z["prox"]) if sup else None
+    dd = [round(dz["prox"], 2), round(dz["dist"], 2)] if dz else None
+    ss = [round(sz["prox"], 2), round(sz["dist"], 2)] if sz else None
+    if not dz or not sz or sz["prox"] <= dz["prox"]:
+        return "eq", dd, ss                   # notes: missing fresh side = assume equilibrium
+    p = (last - dz["prox"]) / (sz["prox"] - dz["prox"])
+    return ("low" if p < 1 / 3 else "high" if p > 2 / 3 else "eq"), dd, ss
 
 
 def rule(kind, loc, trend):
@@ -242,7 +243,7 @@ def last_complete(tf, df):
     return not forming
 
 
-def analyse(meta, f):
+def analyse(meta, f, aux=None):
     Z = {tf: find_zones(df, WMAX[tf], last_complete(tf, df)) for tf, df in f.items()}
     res = []
     for k, tf in enumerate(TFS):
@@ -253,8 +254,8 @@ def analyse(meta, f):
         ema = [float(df.Close.ewm(span=s, adjust=False).mean().iloc[-1]) for s in (20, 50)]
         higher = [x for x in TFS[k + 1:] if x in f]
         itf, htf = MAP[tf]
-        trend = trend_of(f.get(itf)) if itf else None
-        loc = location(f.get(htf), Z.get(htf, []), last) if htf else "na"
+        trend, tsl = trend_of(f.get(itf)) if itf else (None, None)
+        loc, ld, ls = location(f.get(htf), Z.get(htf, []), last) if htf else ("na", None, None)
         fmt = "%d %b %y" if tf in ("D", "W", "M", "Q", "H", "Y") else "%d %b %H:%M"
         for kind in ("demand", "supply"):
             cand = []
@@ -287,6 +288,9 @@ def analyse(meta, f):
                 tbase = 2 if z["nb"] <= 3 else 1 if z["nb"] <= 5 else 0
                 ema_ok = any(lo <= e <= hi for e in ema)
                 score = fresh + z["strength"] + tbase + (1 if ema_ok else 0)
+                want_loc, want_tr = ("low", "up") if kind == "demand" else ("high", "down")
+                lok = True if loc == want_loc else (None if loc in ("eq", "na") else False)   # Location favourable / neutral / against
+                tok = None if trend is None else (trend == want_tr)                           # Trend favourable (sideways = ignore)
                 anchored = tf in ("Q", "H", "Y") or any(x in ("Q", "H", "Y") for x in conf)
                 full = z["touches"] == 0 and not z["garb"] and anchored
                 plan = "Full 2:1" if full else "Quick 1:1 (exit at entry if it reverses)"
@@ -305,12 +309,19 @@ def analyse(meta, f):
                     entry=round(entry, 2), sl=round(sl, 2), target=round(float(tgt), 2),
                     nxt=None if nxt is None else round(float(nxt), 2), room=bool(room),
                     higher=higher, conf=conf, htf=htf, itf=itf, loc=loc, trend=trend,
-                    rule=rule(kind, loc, trend), cred=bool(z["cred"]), nb=z["nb"], gap=z["gap"],
+                    rule=rule(kind, loc, trend), lok=lok, tok=tok, ld=ld, ls=ls, tsl=tsl, cred=bool(z["cred"]), nb=z["nb"], gap=z["gap"],
                     touches=z["touches"], age=n - 1 - z["i"], dist_pct=round(d, 2),
                     formed=df.index[z["i"]].strftime(fmt), idx=z["i"] - (n - win),
                     span=[df.index[-win].strftime(fmt), df.index[-1].strftime(fmt)],
                     lc=[df.index[-1].strftime(fmt)] + [round(float(v), 2) for v in df.iloc[-1][["Open", "High", "Low", "Close"]]],
                     candles=[[round(float(v), 2) for v in r] for r in tail[["Open", "High", "Low", "Close"]].values]))
+    if aux is not None:      # candles + 50 SMA of the location / trend timeframes, stored once per stock
+        for tf in {x for r in res for x in (r["htf"], r["itf"]) if x and x in f}:
+            tl, sm = f[tf].tail(70), f[tf].Close.rolling(50).mean().tail(70)
+            aux[meta[0] + "|" + tf] = dict(
+                c=[[round(float(v), 2) for v in row] for row in tl[["Open", "High", "Low", "Close"]].values],
+                s=[None if np.isnan(v) else round(float(v), 2) for v in sm.values],
+                f=tl.index[0].strftime("%d %b %y"), l=tl.index[-1].strftime("%d %b %y"))
     return res
 
 
@@ -348,12 +359,12 @@ def scan(intraday=False):
             print("SAMPLE", smp, daily[smp + ".NS"].index[-1].date(), "close", round(float(daily[smp + ".NS"].Close.iloc[-1]), 2))
     h60 = fetch(tk, "6mo", "60m") if intraday else {}
     m5 = fetch(tk, "60d", "5m") if intraday else {}
-    out, ok = [], 0
+    out, ok, aux = [], 0, {}
     for t in tk:
         if t not in daily and t not in h60 and t not in m5:
             continue
         try:
-            out += analyse(meta[t], build(daily.get(t), h60.get(t), m5.get(t)))
+            out += analyse(meta[t], build(daily.get(t), h60.get(t), m5.get(t)), aux)
             ok += 1
         except Exception as e:
             print("skip", t, e)
@@ -366,7 +377,7 @@ def scan(intraday=False):
     except Exception:
         pass
     print(f"{len(out)} setups from {ok} stocks, data till {asof}")
-    return out, asof
+    return out, asof, aux
 
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Zone Scanner</title><style>
@@ -392,6 +403,7 @@ button,select,input{font:inherit;color:var(--fg);background:var(--card);border:1
 .lv i{display:block;font-style:normal;font-weight:400;font-size:10px;color:var(--mut)}
 .row{display:flex;justify-content:space-between;margin-top:6px}.tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
 .tag{font-size:11px;padding:1px 6px;border-radius:6px;border:1px solid var(--bd);color:var(--mut)}.tag.on{color:var(--g);border-color:var(--g)}.tag.off{color:var(--r);border-color:var(--r)}
+.tabs{display:flex;gap:6px;margin:8px 0}.tab{flex:1}.tab.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}.tag.tap{cursor:pointer;padding:3px 8px;font-size:12px}
 .more{display:block;margin:12px auto 20px}.empty{grid-column:1/-1;text-align:center;padding:30px 10px;color:var(--mut)}
 details.help{margin:10px 0 24px}details.help summary{cursor:pointer;color:var(--mut);font-size:12px}details.help div{font-size:12px;color:var(--mut);margin-top:6px;line-height:1.6}
 #m{position:fixed;inset:0;background:#0009;display:none;justify-content:center;padding:10px;overflow:auto;z-index:20}
@@ -399,7 +411,7 @@ details.help{margin:10px 0 24px}details.help summary{cursor:pointer;color:var(--
 .cap{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0}.cap label{display:flex;flex-direction:column;gap:2px;font-size:11px;color:var(--mut)}
 rect.demand{fill:#16a34a33}rect.supply{fill:#dc262633}svg{width:100%;height:auto}.x{float:right;min-height:32px;padding:2px 10px}
 </style></head><body>
-<h1>Zone Scanner · Nifty 500</h1><div class="mut">Last scan: __TIME__ IST · Data till: __ASOF__</div><div class="mut">Educational only, not investment advice</div>
+<h1>Zone Scanner · Nifty 500</h1><div class="mut">Last scan: __TIME__ IST <b id="age"></b> · Data till: __ASOF__</div><div id="warn" class="mut" style="color:var(--r)"></div><div class="mut">Educational only, not investment advice</div>
 <div class="seg" id="side"></div>
 <div class="tfs" id="tfs"></div>
 <div class="row2"><input id="q" type="search" placeholder="Search stock">
@@ -411,20 +423,21 @@ rect.demand{fill:#16a34a33}rect.supply{fill:#dc262633}svg{width:100%;height:auto
 <b>DBR, RBR</b> = demand (buy) zones, <b>RBD, DBD</b> = supply (sell) zones.<br>
 <b>Freshness</b>: Fresh = price never came back to the zone, Tested 1× / 2×+ = price has returned that many times.<br><b>Score</b>: 7+ = Type 1 (set and forget), 5–6 = Type 2/3 (needs confirmation), below 5 = no trade. Grade A+ = 7+, A = 6, B = 5, C = below 5. The number after each option is how many setups it shows right now.<br>
 <b>Entry</b> = just beyond the proximal line, <b>Stop loss</b> = just beyond the distal line. Tap a card for the chart, your Qty (set capital and risk there) and full details.<br>
-<b>Rule ✓</b> = higher-timeframe location and trend favour this side. <b>Room ✓</b> = no opposite zone within 2x the stop-loss distance. <b>Price in zone</b> = price is at the zone now (first touch).<br>
+<b>Location</b> (tap it) = where price sits between the nearest fresh demand and supply on the higher timeframe: Low favours buying, High favours selling. <b>Trend</b> (tap it) = 50 SMA slope on the middle timeframe: Up = buy, Down = sell, Sideways = ignore. <b>Execution</b> = the zone itself (trade score, tap it or the card). <b>★ Best</b> = all three are ✓ and score 7+.<br><b>Room ✓</b> = no opposite zone within 2x the stop-loss distance. <b>Price in zone</b> = price is at the zone now (first touch).<br>
 <b>W ✓ / M ✓</b> = a fresh same-side zone on that higher timeframe overlaps this zone or is within 1% (confluence).</div></details>
 <div id="m"><div id="mc"></div></div>
 <script>
-const D=__DATA__,LIM=__LIM__,$=id=>document.getElementById(id);
+const D=__DATA__,AUX=__AUX__,LIM=__LIM__,$=id=>document.getElementById(id);
 const N={Y:"Yearly",H:"Half-yearly",Q:"Quarterly",M:"Monthly",W:"Weekly",D:"Daily","125m":"125 min","75m":"75 min","60m":"60 min"},
 SH={Y:"Year",H:"Half",Q:"Qtr",M:"Month",W:"Week",D:"Day","125m":"125m","75m":"75m","60m":"60m"},ORD=Object.keys(N),
 LC={low:"Low",eq:"Equilibrium",high:"High",na:"n/a"},TR={up:"Up",down:"Down",side:"Sideways"},PAGE=40;
 const CMP={price:(a,b)=>a.price-b.price||b.score-a.score,pricedesc:(a,b)=>b.price-a.price||b.score-a.score,
 score:(a,b)=>b.score-a.score||b.conf.length-a.conf.length||a.price-b.price,near:(a,b)=>Math.abs(a.dist_pct)-Math.abs(b.dist_pct)||a.price-b.price};
+const best=z=>z.score>=7&&z.lok===true&&z.tok===true;
 const FR={"0":z=>z.touches==0,"1":z=>z.touches==1,"2":z=>z.touches>=2,all:()=>true},
-SC={"5":z=>z.score>=5,"7":z=>z.score>=7,t23:z=>z.score>=5&&z.score<7,no:z=>z.score<5,all:()=>true},
+SC={best:z=>best(z),"5":z=>z.score>=5,"7":z=>z.score>=7,t23:z=>z.score>=5&&z.score<7,no:z=>z.score<5,all:()=>true},
 FRL=[["0","Fresh"],["1","Tested 1×"],["2","Tested 2×+"],["all","All zones"]],
-SCL=[["5","Score 5+ (tradable)"],["7","7+ · Type 1"],["t23","5–6 · Type 2/3"],["no","Below 5 · no trade"],["all","All scores"]];
+SCL=[["best","★ Best (Loc+Trend+Exec)"],["5","Score 5+ (tradable)"],["7","7+ · Type 1"],["t23","5–6 · Type 2/3"],["no","Below 5 · no trade"],["all","All scores"]];
 let S={side:"",tf:"ALL",sort:"price",fr:"0",sc:"5",cap:"100000",rk:"1"},L=[],shown=PAGE;
 try{Object.assign(S,JSON.parse(localStorage.getItem("st3")||"{}"))}catch(e){}
 if(S.tf!="ALL"&&!D.some(z=>z.tf==S.tf))S.tf="ALL";if(!FR[S.fr])S.fr="0";if(!SC[S.sc])S.sc="5";
@@ -432,7 +445,8 @@ const save=()=>{try{localStorage.setItem("st3",JSON.stringify(S))}catch(e){}};
 const qty=z=>Math.floor((+S.cap||0)*(+S.rk)/100/Math.abs(z.entry-z.sl));
 const chip=(v,a)=>v===true?`<span class="tag on">${a} ✓</span>`:v===false?`<span class="tag off">${a} ✗</span>`:"";
 function match(z,q,skipTf,lim,st){st=st||S;return(skipTf||st.tf=="ALL"||z.tf==st.tf)&&z.dist_pct<=lim&&(!st.side||z.kind==st.side)&&FR[st.fr](z)&&SC[st.sc](z)&&(!q||(z.sym+" "+z.name).toLowerCase().includes(q))}
-function card(z,i){const tg=[z.live?'<span class="tag on">Price in zone</span>':'',z.touches?`<span class="tag off">Tested ${z.touches}</span>`:'<span class="tag on">Fresh</span>',chip(z.rule,"Rule"),chip(z.room,"Room")];
+const tap=(z,i,mode,txt,v)=>`<span class="tag tap ${v===true?"on":v===false?"off":""}" onclick="event.stopPropagation();chart(${i},'${mode}')">${txt} ${v===true?"✓":v===false?"✗":"–"}</span>`;
+function card(z,i){const tg=[best(z)?'<span class="tag on">★ Best setup</span>':'',tap(z,i,'loc','Location '+LC[z.loc],z.lok),tap(z,i,'trend','Trend '+(z.trend?TR[z.trend]:'–'),z.tok),tap(z,i,'exec','Execution '+z.score,z.score>=7?true:(z.score<5?false:null)),z.live?'<span class="tag on">Price in zone</span>':'',z.touches?`<span class="tag off">Tested ${z.touches}</span>`:'<span class="tag on">Fresh</span>',chip(z.room,"Room")];
 z.conf.forEach(x=>tg.push(`<span class="tag on">${SH[x]} ✓</span>`));
 if(!z.cred)tg.push('<span class="tag off">Reaction zone</span>');if(z.garb)tg.push('<span class="tag off">Poor base</span>');if(z.wide)tg.push('<span class="tag off">Wide base</span>');
 return `<div class="card" onclick="chart(${i})"><div class="hd"><span class="sym">${z.sym}</span><span class="bd">${z.tt}</span><span class="side ${z.kind}">${z.kind=="demand"?"DEMAND":"SUPPLY"} ${z.pat}</span><span class="gr">${z.grade}</span></div>
@@ -454,34 +468,68 @@ function setSide(k){S.side=k;shown=PAGE;save();draw()}
 function resetAll(){S.side="";S.tf="ALL";S.sort="price";S.fr="0";S.sc="5";$("q").value="";shown=PAGE;sync();save();draw()}
 function closeM(){$("m").style.display="none"}
 function capChange(i){S.cap=$("cp").value;S.rk=$("rk").value;save();$("qt").textContent=qty(L[i]);draw()}
-function chart(i){const z=L[i],c=z.candles,W=640,H=290,n=c.length,w=W/n,bs=Math.max(0,z.idx-z.nb);
+function cs(c,w,y){return c.map((k,j)=>{const cc=k[3]>=k[0]?"#16a34a":"#dc2626",x=j*w+w/2;return `<line x1="${x}" x2="${x}" y1="${y(k[1])}" y2="${y(k[2])}" stroke="${cc}"/><rect x="${x-w*.35}" y="${y(Math.max(k[0],k[3]))}" width="${w*.7}" height="${Math.max(1,Math.abs(y(k[0])-y(k[3])))}" fill="${cc}"/>`}).join("")}
+function execView(z,i){const c=z.candles,W=640,H=290,n=c.length,w=W/n,bs=Math.max(0,z.idx-z.nb);
 const lo=Math.min(...c.map(x=>x[2]),z.sl,z.dist)*.997,hi=Math.max(...c.map(x=>x[1]))*1.003,y=v=>H-6-(v-lo)/(hi-lo)*(H-26),
-col=z.kind=="demand"?"#16a34a":"#dc2626",ty=Math.min(y(z.prox),y(z.dist)),bh=Math.abs(y(z.prox)-y(z.dist));
-let s=`<svg viewBox="0 0 ${W} ${H}"><rect class="${z.kind}" x="${bs*w}" y="${ty}" width="${W-bs*w}" height="${Math.max(2,bh)}"/>`;
-c.forEach((k,j)=>{const cc=k[3]>=k[0]?"#16a34a":"#dc2626",x=j*w+w/2;
-s+=`<line x1="${x}" x2="${x}" y1="${y(k[1])}" y2="${y(k[2])}" stroke="${cc}"/><rect x="${x-w*.35}" y="${y(Math.max(k[0],k[3]))}" width="${w*.7}" height="${Math.max(1,Math.abs(y(k[0])-y(k[3])))}" fill="${cc}"/>`});
-const pu=z.prox>z.dist;
+col=z.kind=="demand"?"#16a34a":"#dc2626",ty=Math.min(y(z.prox),y(z.dist)),bh=Math.abs(y(z.prox)-y(z.dist)),pu=z.prox>z.dist;
+let s=`<svg viewBox="0 0 ${W} ${H}"><rect class="${z.kind}" x="${bs*w}" y="${ty}" width="${W-bs*w}" height="${Math.max(2,bh)}"/>`+cs(c,w,y);
 s+=`<line x1="0" x2="${W}" y1="${y(z.entry)}" y2="${y(z.entry)}" stroke="#2563eb" stroke-dasharray="5"/><text x="4" y="${y(z.entry)-3}" font-size="11" fill="#2563eb">Entry ${z.entry}</text>
 <line x1="0" x2="${W}" y1="${y(z.sl)}" y2="${y(z.sl)}" stroke="#dc2626" stroke-dasharray="5"/><text x="4" y="${y(z.sl)+11}" font-size="11" fill="#dc2626">SL ${z.sl}</text>
-<text x="${W-4}" y="${pu?y(z.prox)-3:y(z.prox)+10}" font-size="9" text-anchor="end" fill="${col}">Proximal ${z.prox}</text><text x="${W-4}" y="${pu?y(z.dist)+10:y(z.dist)-3}" font-size="9" text-anchor="end" fill="${col}">Distal ${z.dist}</text>`;
-const p=z.parts;$("mc").innerHTML=`<button class="x" onclick="closeM()">✕</button><div class="sym">${z.sym} · ${z.tt} (${N[z.tf]||z.tf})</div><div class="mut">${z.kind} ${z.pat} · grade ${z.grade} · formed ${z.formed} · price ${z.price}</div><div class="mut">${N[z.tf]} candles ${z.span[0]} → ${z.span[1]} · last candle ${z.lc[0]}: O ${z.lc[1]} H ${z.lc[2]} L ${z.lc[3]} C ${z.lc[4]} (match with the ${N[z.tf]} chart in your app)</div>${s}</svg>
+<text x="${W-4}" y="${pu?y(z.prox)-3:y(z.prox)+10}" font-size="9" text-anchor="end" fill="${col}">Proximal ${z.prox}</text><text x="${W-4}" y="${pu?y(z.dist)+10:y(z.dist)-3}" font-size="9" text-anchor="end" fill="${col}">Distal ${z.dist}</text></svg>`;
+const p=z.parts;
+return `<div class="mut">${N[z.tf]} candles ${z.span[0]} → ${z.span[1]} · last candle ${z.lc[0]}: O ${z.lc[1]} H ${z.lc[2]} L ${z.lc[3]} C ${z.lc[4]} (match with the ${N[z.tf]} chart in your app)</div>${s}
 <div class="cap"><label>Capital (₹)<input id="cp" type="number" inputmode="numeric" value="${S.cap}" oninput="capChange(${i})"></label>
 <label>Risk per trade<select id="rk" onchange="capChange(${i})"><option value="1">1% (beginner)</option><option value="1.5">1.5%</option><option value="2">2% (pro)</option></select></label></div>
 <div><b>Qty <span id="qt">${qty(z)}</span></b> <span class="mut">at entry ${z.entry}, SL ${z.sl}</span></div>
 <div class="mut">Score ${z.score} = Fresh ${p[0]} + Strength ${p[1]} + Base ${p[2]} + EMA ${p[3]} → ${z.etype} · base candles ${z.nb}${z.gap?" · gap":""}</div>
 <div class="mut">Plan: ${z.plan}</div><div class="mut">Entry ladder EP1 ${z.ep[0]} / EP2 ${z.ep[1]} / EP3 ${z.ep[2]} · Proximal ${z.prox} · Distal ${z.dist}</div>
-<div class="mut">Location (${z.htf?N[z.htf]:"n/a"}): ${LC[z.loc]} · Trend (${z.itf?N[z.itf]:"n/a"}): ${z.trend?TR[z.trend]:"–"}</div>
-<div class="mut">Confirmed by: ${z.conf.map(x=>N[x]).join(", ")||"none"} · Opposite zone: ${z.nxt??"none"} · ${z.cred?"Credible":"Reaction of an earlier zone (non-reliable)"}</div>`;
-$("rk").value=S.rk;$("m").style.display="flex"}
+<div class="mut">Confirmed by: ${z.conf.map(x=>N[x]).join(", ")||"none"} · Opposite zone: ${z.nxt??"none"} · ${z.cred?"Credible":"Reaction of an earlier zone (non-reliable)"}</div>`}
+const NA=t=>`<div class="mut" style="margin-top:8px">${t}</div>`;
+function locView(z){if(!z.htf)return NA("This zone is on the highest timeframe, so Location is not checked.");
+const a=AUX[z.sym+"|"+z.htf];if(!a)return NA("Chart data for the "+N[z.htf]+" timeframe is not available.");
+const c=a.c,W=640,H=300,n=c.length,w=W/n,d=z.ld,s=z.ls;
+const vals=c.flatMap(k=>[k[1],k[2]]).concat([z.price],d||[],s||[]),lo=Math.min(...vals)*.995,hi=Math.max(...vals)*1.005,y=v=>H-6-(v-lo)/(hi-lo)*(H-14);
+let g=`<svg viewBox="0 0 ${W} ${H}">`,both=d&&s&&s[0]>d[0];
+if(both){const t1=d[0]+(s[0]-d[0])/3,t2=d[0]+(s[0]-d[0])*2/3;
+g+=`<rect x="0" y="${y(t1)}" width="${W}" height="${y(d[0])-y(t1)}" fill="#16a34a" opacity=".10"/><rect x="0" y="${y(t2)}" width="${W}" height="${y(t1)-y(t2)}" fill="#888" opacity=".10"/><rect x="0" y="${y(s[0])}" width="${W}" height="${y(t2)-y(s[0])}" fill="#dc2626" opacity=".10"/>
+<text x="${W-4}" y="${y(d[0])-4}" font-size="10" text-anchor="end" fill="#16a34a">Low</text><text x="${W-4}" y="${y(t1)-4}" font-size="10" text-anchor="end" fill="#888">Equilibrium</text><text x="${W-4}" y="${y(t2)-4}" font-size="10" text-anchor="end" fill="#dc2626">High</text>`}
+g+=cs(c,w,y);
+const zb=(zz,col,t)=>zz?`<rect x="0" y="${Math.min(y(zz[0]),y(zz[1]))}" width="${W}" height="${Math.max(2,Math.abs(y(zz[0])-y(zz[1])))}" fill="${col}" opacity=".28"/><text x="4" y="${Math.min(y(zz[0]),y(zz[1]))-3}" font-size="10" fill="${col}">${t} ${zz[0]}–${zz[1]}</text>`:"";
+g+=zb(d,"#16a34a","Fresh demand")+zb(s,"#dc2626","Fresh supply")+`<line x1="0" x2="${W}" y1="${y(z.price)}" y2="${y(z.price)}" stroke="#2563eb" stroke-dasharray="5"/><text x="4" y="${y(z.price)+12}" font-size="11" fill="#2563eb">Price ${z.price}</text></svg>`;
+const pos=both?Math.round((z.price-d[0])/(s[0]-d[0])*100):null,fav=z.lok===true?"favourable":z.lok===false?"against this setup":"neutral (trend decides)";
+return `<div class="mut">Location is read on the ${N[z.htf]} chart (${a.f} → ${a.l})</div>${g}
+<div class="mut">Nearest fresh demand: ${d?d[0]+" – "+d[1]:"none"} · Nearest fresh supply: ${s?s[0]+" – "+s[1]:"none"}</div>
+<div class="mut">${pos===null?"One side has no fresh zone, so the notes say to treat price as Equilibrium and let the trend decide.":"Price is "+pos+"% of the way from demand to supply (split in thirds: Low / Equilibrium / High)."}</div>
+<div><b>Location: ${LC[z.loc]}</b> → ${fav} for a ${z.kind} setup. <span class="mut">Low favours buying at demand, High favours selling at supply.</span></div>`}
+function trendView(z){if(!z.itf)return NA("This zone is on the highest timeframe, so Trend is not checked.");
+const a=AUX[z.sym+"|"+z.itf];if(!a)return NA("Chart data for the "+N[z.itf]+" timeframe is not available.");
+const c=a.c,sm=a.s,W=640,H=300,n=c.length,w=W/n,vals=c.flatMap(k=>[k[1],k[2]]).concat(sm.filter(v=>v!==null)),lo=Math.min(...vals)*.995,hi=Math.max(...vals)*1.005,y=v=>H-6-(v-lo)/(hi-lo)*(H-14);
+let g=`<svg viewBox="0 0 ${W} ${H}">`+cs(c,w,y);
+g+=`<polyline points="${sm.map((v,j)=>v===null?"":(j*w+w/2)+","+y(v)).filter(Boolean).join(" ")}" fill="none" stroke="#f59e0b" stroke-width="2"/>`;
+const j7=n-8,v7=sm[j7],v0=sm[n-1];
+if(v7!==null&&v7!==undefined&&v0!==null){const x7=j7*w+w/2;g+=`<line x1="${x7}" x2="${x7}" y1="0" y2="${H}" stroke="#888" stroke-dasharray="4"/><line x1="${x7}" x2="${W}" y1="${y(v7)}" y2="${y(v7)}" stroke="#888" stroke-dasharray="4"/><text x="${x7+3}" y="12" font-size="10" fill="#888">7 candles back</text><circle cx="${n*w-w/2}" cy="${y(v0)}" r="3.5" fill="#f59e0b"/>`}
+g+="</svg>";const fav=z.tok===true?"favours this setup":z.tok===false?"does not favour this setup":"unknown";
+return `<div class="mut">Trend is read on the ${N[z.itf]} chart (${a.f} → ${a.l}) with the 50 SMA (orange)</div>${g}
+<div class="mut">The 50 SMA moved ${z.tsl==null?"–":(z.tsl>0?"+":"")+z.tsl} × ATR over the last 7 candles (flat if between ±0.4).</div>
+<div><b>Trend: ${z.trend?TR[z.trend]:"–"}</b> → ${fav} for a ${z.kind} setup. <span class="mut">Up = buy at demand, Down = sell at supply, Sideways = ignore.</span></div>`}
+function chart(i,mode){mode=mode||"exec";const z=L[i];
+const tabs=[["exec","Execution"],["loc","Location"],["trend","Trend"]].map(([k,n])=>`<button class="tab ${mode==k?"on":""}" onclick="chart(${i},'${k}')">${n}</button>`).join("");
+const body=mode=="loc"?locView(z):mode=="trend"?trendView(z):execView(z,i);
+$("mc").innerHTML=`<button class="x" onclick="closeM()">✕</button><div class="sym">${z.sym} · ${z.tt} (${N[z.tf]||z.tf})</div><div class="mut">${z.kind} ${z.pat} · grade ${z.grade}${best(z)?" · ★ Best setup":""} · formed ${z.formed} · price ${z.price}</div><div class="tabs">${tabs}</div>${body}`;
+if(mode=="exec")$("rk").value=S.rk;$("m").style.display="flex"}
 $("sort").onchange=()=>{S.sort=$("sort").value;shown=PAGE;save();draw()};$("fr").onchange=()=>{S.fr=$("fr").value;shown=PAGE;save();draw()};$("sc").onchange=()=>{S.sc=$("sc").value;shown=PAGE;save();draw()};
 $("q").oninput=()=>{shown=PAGE;draw()};$("more").onclick=()=>{shown+=PAGE;draw()};$("m").onclick=e=>{if(e.target==$("m"))closeM()};
+(function(){const m=Math.max(0,Math.round((Date.now()-new Date("__TS__"))/60000)),t=m<90?m+" min":(m/60).toFixed(1)+" h",
+ist=new Date(Date.now()+19800000),mins=ist.getUTCHours()*60+ist.getUTCMinutes(),open=ist.getUTCDay()>=1&&ist.getUTCDay()<=5&&mins>=555&&mins<=930;
+$("age").textContent="("+t+" ago)";
+if(open&&m>75)$("warn").textContent="⚠ Market is open but this scan is "+t+" old. Run the scan again: GitHub → Actions → scan → Run workflow.";})();
 sync();draw();
 </script></body></html>"""
 
 
-def write_html(data, path, asof=""):
+def write_html(data, path, asof="", aux=None):
     ist = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
-    html = PAGE.replace("__DATA__", json.dumps(data)).replace("__TIME__", ist.strftime("%d %b %Y %H:%M")).replace("__ASOF__", asof or "n/a").replace("__LIM__", json.dumps(DIST))
+    html = PAGE.replace("__DATA__", json.dumps(data, separators=(",", ":"))).replace("__AUX__", json.dumps(aux or {}, separators=(",", ":"))).replace("__TIME__", ist.strftime("%d %b %Y %H:%M")).replace("__ASOF__", asof or "n/a").replace("__TS__", dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")).replace("__LIM__", json.dumps(DIST))
     open(path, "w", encoding="utf-8").write(html)
     print("Saved", path)
 
@@ -493,8 +541,8 @@ if __name__ == "__main__":
     ap.add_argument("--intraday", action="store_true", help="also scan 60/75/125 min (slower)")
     a = ap.parse_args()
     while True:
-        data, asof = scan(a.intraday)
-        write_html(data, a.out, asof)
+        data, asof, aux = scan(a.intraday)
+        write_html(data, a.out, asof, aux)
         if not a.watch:
             break
         time.sleep(a.watch * 60)
